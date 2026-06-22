@@ -2,6 +2,7 @@
 
 mod checkout;
 mod clone;
+mod compression;
 mod error;
 mod git_object;
 mod local;
@@ -11,6 +12,7 @@ mod protocol;
 mod repo;
 
 pub use clone::{CloneRequest, clone_repo};
+pub use compression::compression_backend;
 pub use error::CloneError;
 pub use local::{LocalCloneReport, LocalCloneRequest, local_clone};
 pub use metrics::CloneReport;

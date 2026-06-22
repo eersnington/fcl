@@ -7,6 +7,7 @@ use std::time::Instant;
 use url::Url;
 
 use crate::checkout::materialize_default_branch;
+use crate::compression::compression_backend;
 use crate::error::CloneError;
 use crate::metrics::{CloneReport, measure_ms};
 use crate::pack::{
@@ -127,6 +128,7 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
     )?;
 
     Ok(CloneReport {
+        compression_backend: compression_backend(),
         ref_count,
         pack_bytes,
         total_ms,
@@ -274,6 +276,7 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
     )?;
 
     Ok(CloneReport {
+        compression_backend: compression_backend(),
         ref_count,
         pack_bytes,
         total_ms,

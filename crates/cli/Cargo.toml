@@ -12,3 +12,13 @@ tempfile = "3.22.0"
 
 [lints]
 workspace = true
+
+[features]
+default = ["fcl-core/default"]
+flate2-rust = ["fcl-core/flate2-rust"]
+flate2-miniz-oxide = ["fcl-core/flate2-miniz-oxide"]
+flate2-zlib = ["fcl-core/flate2-zlib"]
+flate2-zlib-default = ["fcl-core/flate2-zlib-default"]
+flate2-zlib-ng = ["fcl-core/flate2-zlib-ng"]
+flate2-zlib-ng-compat = ["fcl-core/flate2-zlib-ng-compat"]
+flate2-zlib-rs = ["fcl-core/flate2-zlib-rs"]

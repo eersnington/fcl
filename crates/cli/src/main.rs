@@ -59,6 +59,7 @@ fn main() {
 
     match clone_repo(request) {
         Ok(report) => {
+            eprintln!("fcl: compression backend {}", report.compression_backend);
             eprintln!("fcl: fetched {} refs", report.ref_count);
             eprintln!("fcl: wrote {} bytes of pack data", report.pack_bytes);
             eprintln!(

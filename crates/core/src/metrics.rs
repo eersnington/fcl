@@ -2,6 +2,7 @@ use std::time::Instant;
 
 #[derive(Debug)]
 pub struct CloneReport {
+    pub compression_backend: &'static str,
     pub ref_count: usize,
     pub pack_bytes: u64,
     pub total_ms: u128,

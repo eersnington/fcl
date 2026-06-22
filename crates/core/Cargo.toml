@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 crc32fast = "1.5.0"
-flate2 = "1.1.5"
+flate2 = { version = "1.1.5", default-features = false }
 hex = "0.4.3"
 memory-stats = "1.2.0"
 rayon = "1.11.0"
@@ -17,3 +17,13 @@ url = "2.5.7"
 
 [lints]
 workspace = true
+
+[features]
+default = ["flate2-zlib"]
+flate2-rust = ["flate2/rust_backend"]
+flate2-miniz-oxide = ["flate2/miniz_oxide"]
+flate2-zlib = ["flate2/zlib"]
+flate2-zlib-default = ["flate2/zlib-default"]
+flate2-zlib-ng = ["flate2/zlib-ng"]
+flate2-zlib-ng-compat = ["flate2/zlib-ng-compat"]
+flate2-zlib-rs = ["flate2/zlib-rs"]
