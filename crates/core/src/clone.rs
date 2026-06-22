@@ -7,7 +7,7 @@ use url::Url;
 use crate::checkout::materialize_default_branch;
 use crate::error::CloneError;
 use crate::metrics::{CloneReport, measure_ms};
-use crate::pack::{ObjectId, ingest_fetched_pack, ingest_scanned_pack, read_pack_arc};
+use crate::pack::{ObjectId, PackStorage, ingest_fetched_pack, ingest_scanned_pack};
 use crate::protocol::{discover_remote, fetch_full_pack, http_client};
 use crate::repo::RepoLayout;
 
@@ -54,7 +54,7 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let streaming_pack_scan = fetched_pack.scan.is_some();
     let (ingest_report, ingest_ms) = measure_ms(|| {
         if let Some(scan) = fetched_pack.scan.as_ref() {
-            let pack = read_pack_arc(&repo.pack_temp_path())?;
+            let pack = PackStorage::open_file_backed(&repo.pack_temp_path())?;
             ingest_scanned_pack(
                 &repo.pack_temp_path(),
                 &repo.pack_index_temp_path(),

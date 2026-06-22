@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 use crc32fast::Hasher as Crc32;
 use flate2::{Decompress, FlushDecompress, Status};
@@ -101,7 +104,7 @@ pub trait ObjectReader: Sync {
 #[derive(Debug, Clone)]
 pub struct PackIndex {
     pack_path: PathBuf,
-    pack: Arc<[u8]>,
+    pack: PackStorage,
     meta_by_oid: HashMap<ObjectId, ObjectMeta>,
     oid_by_offset: HashMap<u64, ObjectId>,
     state_by_oid: HashMap<ObjectId, ObjectDataState>,
@@ -110,6 +113,21 @@ pub struct PackIndex {
     spilled_object_count: usize,
     spilled_object_bytes: usize,
     reconstructed_object_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackStorage {
+    inner: PackStorageInner,
+}
+
+#[derive(Debug, Clone)]
+enum PackStorageInner {
+    #[cfg(any(test, not(unix)))]
+    Memory(Arc<[u8]>),
+    FileBacked {
+        file: Arc<File>,
+        len: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -157,6 +175,72 @@ impl PackIndex {
     pub fn reconstructed_object_count(&self) -> usize {
         self.reconstructed_object_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl PackStorage {
+    #[cfg(any(test, not(unix)))]
+    pub const fn from_memory(pack: Arc<[u8]>) -> Self {
+        Self {
+            inner: PackStorageInner::Memory(pack),
+        }
+    }
+
+    pub fn open_file_backed(pack_path: &Path) -> Result<Self, CloneError> {
+        #[cfg(unix)]
+        {
+            let file = File::open(pack_path).map_err(|error| CloneError::PackIndexFailed {
+                path: pack_path.to_owned(),
+                operation: "opening pack file for file-backed access",
+                detail: error.to_string(),
+            })?;
+            let len = file
+                .metadata()
+                .map_err(|error| CloneError::PackIndexFailed {
+                    path: pack_path.to_owned(),
+                    operation: "reading file-backed pack metadata",
+                    detail: error.to_string(),
+                })?
+                .len();
+            Ok(Self {
+                inner: PackStorageInner::FileBacked {
+                    file: Arc::new(file),
+                    len,
+                },
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            read_pack_arc(pack_path).map(Self::from_memory)
+        }
+    }
+
+    fn inflate_frame(
+        &self,
+        pack_path: &Path,
+        frame: &ObjectFrame,
+    ) -> Result<Arc<[u8]>, CloneError> {
+        match &self.inner {
+            #[cfg(any(test, not(unix)))]
+            PackStorageInner::Memory(pack) => inflate_frame(pack_path, pack.as_ref(), frame),
+            PackStorageInner::FileBacked { file, len } => {
+                let compressed_end = checked_frame_end(pack_path, frame, *len)?;
+                let mut compressed = vec![0u8; frame.compressed_len];
+                read_exact_at(
+                    pack_path,
+                    file,
+                    frame.compressed_start as u64,
+                    &mut compressed,
+                    "reading compressed object range",
+                )?;
+                debug_assert_eq!(
+                    compressed_end,
+                    frame.compressed_start as u64 + compressed.len() as u64
+                );
+                inflate_compressed_frame(pack_path, frame, &compressed)
+            }
+        }
     }
 }
 
@@ -278,7 +362,7 @@ impl PackIndex {
             inflated: None,
             declared_size: meta.pack_inflated_size,
         };
-        let payload = inflate_frame(&self.pack_path, self.pack.as_ref(), &frame)?;
+        let payload = self.pack.inflate_frame(&self.pack_path, &frame)?;
         match meta.delta_base {
             None => Ok(payload),
             Some(DeltaBase::Offset(base_offset)) => {
@@ -406,7 +490,13 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIngestRepo
     let scan = scan_pack(pack_path, pack.as_ref(), scan_payload)?;
     let scan_ms = scan_start.elapsed().as_millis();
 
-    ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms)
+    ingest_scanned_pack(
+        pack_path,
+        index_path,
+        PackStorage::from_memory(pack),
+        &scan,
+        scan_ms,
+    )
 }
 
 pub fn ingest_fetched_pack(
@@ -424,7 +514,9 @@ pub fn ingest_fetched_pack(
     let scan_start = Instant::now();
     let scan = scan_pack_with_checksum(pack_path, pack.as_ref(), scan_payload, checksum)?;
     let scan_ms = scan_start.elapsed().as_millis();
+    drop(pack);
 
+    let pack = PackStorage::open_file_backed(pack_path)?;
     ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms)
 }
 
@@ -440,12 +532,12 @@ pub fn read_pack_arc(pack_path: &Path) -> Result<Arc<[u8]>, CloneError> {
 pub fn ingest_scanned_pack(
     pack_path: &Path,
     index_path: &Path,
-    pack: Arc<[u8]>,
+    pack: PackStorage,
     scan: &PackScan,
     scan_ms: u128,
 ) -> Result<PackIngestReport, CloneError> {
     let resolve_start = Instant::now();
-    let resolved = resolve_inflated_frames(pack_path, pack.as_ref(), &scan.frames)?;
+    let resolved = resolve_inflated_frames(pack_path, &pack, &scan.frames)?;
     let resolve_ms = resolve_start.elapsed().as_millis();
 
     let mut entries = resolved
@@ -1315,7 +1407,7 @@ fn inflate_next_frame(
 )]
 fn resolve_inflated_frames(
     pack_path: &Path,
-    pack: &[u8],
+    pack: &PackStorage,
     frames: &[ObjectFrame],
 ) -> Result<Vec<ResolvedFrame>, CloneError> {
     let adjacency = build_delta_adjacency(frames);
@@ -1487,11 +1579,11 @@ fn release_delta_base_if_done(
 
 fn frame_payload(
     pack_path: &Path,
-    pack: &[u8],
+    pack: &PackStorage,
     frame: &ObjectFrame,
 ) -> Result<Arc<[u8]>, CloneError> {
     frame.inflated.as_ref().map_or_else(
-        || inflate_frame(pack_path, pack, frame),
+        || pack.inflate_frame(pack_path, frame),
         |inflated| Ok(Arc::clone(inflated)),
     )
 }
@@ -1532,10 +1624,21 @@ fn scan_zlib_stream_len(pack_path: &Path, pack: &[u8], offset: usize) -> Result<
     }
 }
 
+#[cfg(any(test, not(unix)))]
 fn inflate_frame(
     pack_path: &Path,
     pack: &[u8],
     frame: &ObjectFrame,
+) -> Result<Arc<[u8]>, CloneError> {
+    checked_frame_end(pack_path, frame, pack.len() as u64)?;
+    let compressed = &pack[frame.compressed_start..frame.compressed_start + frame.compressed_len];
+    inflate_compressed_frame(pack_path, frame, compressed)
+}
+
+fn inflate_compressed_frame(
+    pack_path: &Path,
+    frame: &ObjectFrame,
+    compressed: &[u8],
 ) -> Result<Arc<[u8]>, CloneError> {
     let mut decompressor = Decompress::new(true);
     let mut output = Vec::with_capacity(usize_from_u64(
@@ -1544,7 +1647,6 @@ fn inflate_frame(
         frame.declared_size,
     )?);
     let mut chunk = [0u8; 8192];
-    let compressed = &pack[frame.compressed_start..frame.compressed_start + frame.compressed_len];
 
     loop {
         let before_in = decompressor.total_in();
@@ -1589,6 +1691,125 @@ fn inflate_frame(
             });
         }
     }
+}
+
+fn checked_frame_end(
+    pack_path: &Path,
+    frame: &ObjectFrame,
+    pack_len: u64,
+) -> Result<u64, CloneError> {
+    let compressed_start =
+        u64::try_from(frame.compressed_start).map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "reading compressed object range",
+            detail: format!(
+                "compressed start {} did not fit u64: {error}",
+                frame.compressed_start
+            ),
+        })?;
+    let compressed_len =
+        u64::try_from(frame.compressed_len).map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "reading compressed object range",
+            detail: format!(
+                "compressed length {} did not fit u64: {error}",
+                frame.compressed_len
+            ),
+        })?;
+    let compressed_end = compressed_start
+        .checked_add(compressed_len)
+        .ok_or_else(|| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "reading compressed object range",
+            detail: format!(
+                "compressed range {}..+{} overflowed u64",
+                frame.compressed_start, frame.compressed_len
+            ),
+        })?;
+    if compressed_end > pack_len {
+        return Err(CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "reading compressed object range",
+            detail: format!(
+                "object at offset {} uses compressed range {}..{}, but pack is {pack_len} bytes",
+                frame.offset, frame.compressed_start, compressed_end
+            ),
+        });
+    }
+    Ok(compressed_end)
+}
+
+#[cfg(unix)]
+fn read_exact_at(
+    pack_path: &Path,
+    file: &File,
+    offset: u64,
+    buffer: &mut [u8],
+    operation: &'static str,
+) -> Result<(), CloneError> {
+    let mut read = 0usize;
+    while read < buffer.len() {
+        match file.read_at(&mut buffer[read..], offset + read as u64) {
+            Ok(0) => {
+                return Err(CloneError::PackIndexFailed {
+                    path: pack_path.to_owned(),
+                    operation,
+                    detail: format!(
+                        "short read at offset {offset}: read {read} of {} bytes",
+                        buffer.len()
+                    ),
+                });
+            }
+            Ok(bytes) => read += bytes,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(CloneError::PackIndexFailed {
+                    path: pack_path.to_owned(),
+                    operation,
+                    detail: format!(
+                        "failed at offset {} after reading {read} of {} bytes: {error}",
+                        offset + read as u64,
+                        buffer.len()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(
+    pack_path: &Path,
+    file: &File,
+    offset: u64,
+    buffer: &mut [u8],
+    operation: &'static str,
+) -> Result<(), CloneError> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = file
+        .try_clone()
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation,
+            detail: format!("cloning file handle for positional read failed: {error}"),
+        })?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation,
+            detail: format!("seeking to offset {offset} failed: {error}"),
+        })?;
+    file.read_exact(buffer)
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation,
+            detail: format!(
+                "failed to read {} bytes at offset {offset}: {error}",
+                buffer.len()
+            ),
+        })
 }
 
 fn env_bool(name: &str) -> bool {
@@ -1916,9 +2137,10 @@ fn validate_unique_objects(index_path: &Path, entries: &[IndexEntry]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedObjectKind, PackIndex, ScanPayload, ingest_pack, ingest_scanned_pack, scan_pack,
-        validate_pack,
+        EncodedObjectKind, ObjectDataState, PackIndex, PackStorage, ScanPayload, ingest_pack,
+        ingest_scanned_pack, scan_pack, validate_pack,
     };
+    use crate::pack::{ObjectId, ObjectReader};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1955,8 +2177,14 @@ mod tests {
             ScanPayload::Inflate
         };
         let scan = scan_pack(&pack_path, pack.as_ref(), scan_payload).expect("scan should work");
-        let scanned = ingest_scanned_pack(&pack_path, &scanned_idx, pack, &scan, 0)
-            .expect("scanned ingest should work");
+        let scanned = ingest_scanned_pack(
+            &pack_path,
+            &scanned_idx,
+            PackStorage::from_memory(pack),
+            &scan,
+            0,
+        )
+        .expect("scanned ingest should work");
 
         assert_eq!(
             fs::read(complete_idx).expect("complete idx should exist"),
@@ -2003,6 +2231,97 @@ mod tests {
         fs::remove_dir_all(temp).expect("test temp directory should be removed");
     }
 
+    #[test]
+    fn file_backed_storage_should_inflate_scanned_frame() {
+        let temp = test_temp_dir("file-backed-inflate");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let scan = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+        let storage = PackStorage::open_file_backed(&pack_path)
+            .expect("file-backed pack storage should open");
+        let frame = scan.frames.first().expect("pack should contain a frame");
+
+        let inflated = storage
+            .inflate_frame(&pack_path, frame)
+            .expect("file-backed frame should inflate");
+
+        assert_eq!(inflated.len() as u64, frame.declared_size);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn file_backed_ingest_should_match_memory_ingest() {
+        let temp = test_temp_dir("file-backed-ingest");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let pack = Arc::<[u8]>::from(pack);
+        let scan = scan_pack(&pack_path, pack.as_ref(), ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+        let memory_idx = temp.join("memory.idx");
+        let file_idx = temp.join("file.idx");
+        let memory = ingest_scanned_pack(
+            &pack_path,
+            &memory_idx,
+            PackStorage::from_memory(Arc::clone(&pack)),
+            &scan,
+            0,
+        )
+        .expect("memory ingest should work");
+        let file_backed = ingest_scanned_pack(
+            &pack_path,
+            &file_idx,
+            PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
+            &scan,
+            0,
+        )
+        .expect("file-backed ingest should work");
+
+        assert_eq!(
+            fs::read(memory_idx).expect("memory idx should exist"),
+            fs::read(file_idx).expect("file-backed idx should exist")
+        );
+        assert_same_index_metadata(&memory.index, &file_backed.index);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn file_backed_index_should_reconstruct_blob_from_pack() {
+        let temp = test_temp_dir("file-backed-reconstruct");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let scan = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+        let blob_oid = ObjectId::parse_hex(&run_git_stdout(&repo, &["rev-parse", "HEAD:file.txt"]))
+            .expect("blob oid should parse");
+        let expected =
+            fs::read(repo.join("file.txt")).expect("working tree blob should be readable");
+        let mut report = ingest_scanned_pack(
+            &pack_path,
+            &temp.join("file-backed.idx"),
+            PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
+            &scan,
+            0,
+        )
+        .expect("file-backed ingest should work");
+        report
+            .index
+            .state_by_oid
+            .insert(blob_oid, ObjectDataState::Reconstructable);
+        let mut actual = Vec::new();
+
+        report
+            .index
+            .stream_blob(blob_oid, &mut actual)
+            .expect("blob should reconstruct from file-backed pack");
+
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
     fn test_temp_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2027,6 +2346,23 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn run_git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {} failed: stdout=`{}` stderr=`{}`",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     fn build_packed_test_repo(temp: &Path) -> PathBuf {
