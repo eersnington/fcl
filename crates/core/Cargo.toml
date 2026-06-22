@@ -12,7 +12,6 @@ rayon = "1.11.0"
 reflink-copy = "0.1.30"
 reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "hickory-dns", "rustls-tls"] }
 sha1 = "0.10.6"
-tar = "0.4.44"
 thiserror = "2.0.16"
 url = "2.5.7"
 

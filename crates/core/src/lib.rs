@@ -1,6 +1,5 @@
 #![deny(unsafe_code)]
 
-mod archive;
 mod checkout;
 mod clone;
 mod error;

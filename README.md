@@ -177,14 +177,6 @@ FCL_REQUEST_TIMEOUT_SECS=300
 FCL_POOL_IDLE_TIMEOUT_SECS=4
 ```
 
-Experimental archive-assisted checkout:
-
-```bash
-FCL_ARCHIVE_CHECKOUT=1
-```
-
-This is only for checkout experiments. The final repository still needs a full pack and valid Git object database.
-
 ## Repository layout
 
 - `crates/core`: protocol, pack ingest, object reader, checkout, local CoW clone.

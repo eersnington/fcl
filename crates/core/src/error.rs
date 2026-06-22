@@ -109,12 +109,6 @@ pub enum CloneError {
         detail: String,
     },
 
-    #[error("archive checkout failed while {operation}: {detail}")]
-    ArchiveCheckoutFailed {
-        operation: &'static str,
-        detail: String,
-    },
-
     #[error("local clone failed for `{path}` while {operation}: {detail}")]
     LocalCloneFailed {
         path: PathBuf,

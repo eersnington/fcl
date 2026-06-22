@@ -1,13 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
+use std::time::Instant;
 
 use url::Url;
 
-use crate::archive::{archive_checkout_enabled, checkout_github_archive};
-use crate::checkout::{index_existing_default_branch, materialize_default_branch};
+use crate::checkout::materialize_default_branch;
 use crate::error::CloneError;
-use crate::metrics::{CloneMetrics, CloneReport, measure_ms};
+use crate::metrics::{CloneReport, measure_ms};
 use crate::pack::{ObjectId, ingest_pack};
 use crate::protocol::{discover_remote, fetch_full_pack, http_client};
 use crate::repo::RepoLayout;
@@ -25,33 +24,27 @@ impl CloneRequest {
 }
 
 pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
-    let mut metrics = CloneMetrics::start();
+    let start = Instant::now();
     let client = http_client()?;
     let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
     let remote = remote?;
-    metrics.discovery_ms = discovery_ms;
     let refs = remote.refs.select_full_clone_universe();
-    metrics.ref_count = refs.len();
+    let ref_count = refs.len();
+    let default_branch = resolve_default_branch(remote.refs.default_branch.as_deref(), &refs)?;
+    let default_commit = ObjectId::parse_hex(&default_branch.oid)?;
 
     let target = match request.target {
         Some(target) => target,
         None => default_target_dir(&request.url)?,
     };
     let repo = RepoLayout::create(&target)?;
-    let checkout_head = checkout_head_oid(remote.refs.default_branch.as_ref(), &refs)?;
-    let archive_checkout = spawn_archive_checkout(
-        &request.url,
-        checkout_head.to_hex(),
-        repo.root().to_path_buf(),
-    );
 
     let (pack_bytes, fetch_ms) =
         measure_ms(|| fetch_full_pack(&client, &remote, &refs, &repo.pack_temp_path()));
-    metrics.pack_bytes = pack_bytes?;
-    metrics.fetch_ms = fetch_ms;
+    let pack_bytes = pack_bytes?;
     enforce_max_bytes(
         "FCL_MAX_PACK_BYTES",
-        metrics.pack_bytes,
+        pack_bytes,
         "checking fetched pack size",
     )?;
     enforce_max_bytes(
@@ -62,43 +55,51 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let (pack_index, ingest_ms) =
         measure_ms(|| ingest_pack(&repo.pack_temp_path(), &repo.pack_index_temp_path()));
     let pack_index = pack_index?;
-    metrics.ingest_ms = ingest_ms;
-    metrics.retained_object_count = pack_index.retained_object_count();
-    metrics.retained_object_bytes = pack_index.retained_object_bytes();
-    metrics.spilled_object_count = pack_index.spilled_object_count();
-    metrics.spilled_object_bytes = pack_index.spilled_object_bytes();
-    repo.write_initial_metadata(&remote, &refs)?;
+    let retained_object_count = pack_index.retained_object_count();
+    let retained_object_bytes = pack_index.retained_object_bytes();
+    let spilled_object_count = pack_index.spilled_object_count();
+    let spilled_object_bytes = pack_index.spilled_object_bytes();
+    repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
     enforce_max_bytes(
         "FCL_MAX_TEMP_BYTES",
         directory_bytes(repo.root())?,
         "checking target size after ingest",
     )?;
-    let (checkout, checkout_ms) = measure_ms(|| {
-        if archive_checkout_completed(archive_checkout) {
-            index_existing_default_branch(&repo, &pack_index, &remote.refs, &refs)
-        } else {
-            materialize_default_branch(&repo, &pack_index, &remote.refs, &refs)
-        }
-    });
+    let (checkout, checkout_ms) =
+        measure_ms(|| materialize_default_branch(&repo, &pack_index, default_commit));
     let checkout = checkout?;
-    metrics.checkout_ms = checkout_ms;
-    metrics.checkout_manifest_ms = checkout.manifest_ms;
-    metrics.checkout_dir_create_ms = checkout.dir_create_ms;
-    metrics.checkout_file_materialize_ms = checkout.file_materialize_ms;
-    metrics.checkout_index_write_ms = checkout.index_write_ms;
-    metrics.checkout_file_count = checkout.file_count;
-    metrics.checkout_dir_count = checkout.dir_count;
-    metrics.checkout_blob_bytes = checkout.blob_bytes;
-    metrics.reconstructed_object_count = pack_index.reconstructed_object_count();
-    metrics.target_bytes = directory_bytes(repo.root())?;
-    metrics.rss_bytes = rss_bytes();
+    let reconstructed_object_count = pack_index.reconstructed_object_count();
+    let target_bytes = directory_bytes(repo.root())?;
+    let rss_bytes = rss_bytes();
     enforce_max_bytes(
         "FCL_MAX_TEMP_BYTES",
-        metrics.target_bytes,
+        target_bytes,
         "checking final target size",
     )?;
 
-    Ok(metrics.into())
+    Ok(CloneReport {
+        ref_count,
+        pack_bytes,
+        total_ms: start.elapsed().as_millis(),
+        discovery_ms,
+        fetch_ms,
+        ingest_ms,
+        checkout_ms,
+        checkout_manifest_ms: checkout.manifest_ms,
+        checkout_dir_create_ms: checkout.dir_create_ms,
+        checkout_file_materialize_ms: checkout.file_materialize_ms,
+        checkout_index_write_ms: checkout.index_write_ms,
+        checkout_file_count: checkout.file_count,
+        checkout_dir_count: checkout.dir_count,
+        checkout_blob_bytes: checkout.blob_bytes,
+        retained_object_count,
+        retained_object_bytes,
+        spilled_object_count,
+        spilled_object_bytes,
+        reconstructed_object_count,
+        target_bytes,
+        rss_bytes,
+    })
 }
 
 fn enforce_max_bytes(
@@ -162,31 +163,10 @@ fn rss_bytes() -> Option<u64> {
     memory_stats::memory_stats().map(|stats| stats.physical_mem as u64)
 }
 
-fn spawn_archive_checkout(
-    url: &str,
-    head: String,
-    target: PathBuf,
-) -> Option<JoinHandle<Result<(), CloneError>>> {
-    if !archive_checkout_enabled() {
-        return None;
-    }
-    let url = url.to_owned();
-    Some(std::thread::spawn(move || {
-        checkout_github_archive(&url, &head, &target)
-    }))
-}
-
-fn archive_checkout_completed(handle: Option<JoinHandle<Result<(), CloneError>>>) -> bool {
-    let Some(handle) = handle else {
-        return false;
-    };
-    matches!(handle.join(), Ok(Ok(())))
-}
-
-fn checkout_head_oid(
-    default_branch: Option<&String>,
-    refs: &[crate::protocol::RemoteRef],
-) -> Result<ObjectId, CloneError> {
+fn resolve_default_branch<'a>(
+    default_branch: Option<&str>,
+    refs: &'a [crate::protocol::RemoteRef],
+) -> Result<&'a crate::protocol::RemoteRef, CloneError> {
     let Some(default_branch) = default_branch else {
         return Err(CloneError::CheckoutFailed {
             path: PathBuf::from("."),
@@ -194,15 +174,13 @@ fn checkout_head_oid(
             detail: "remote did not advertise a HEAD symref".to_owned(),
         });
     };
-    let head = refs
-        .iter()
-        .find(|remote_ref| remote_ref.name == *default_branch)
+    refs.iter()
+        .find(|remote_ref| remote_ref.name == default_branch)
         .ok_or_else(|| CloneError::CheckoutFailed {
             path: PathBuf::from("."),
             operation: "resolving default branch",
             detail: format!("HEAD points to `{default_branch}`, but that ref was not fetched"),
-        })?;
-    ObjectId::parse_hex(&head.oid)
+        })
 }
 
 fn default_target_dir(raw_url: &str) -> Result<PathBuf, CloneError> {

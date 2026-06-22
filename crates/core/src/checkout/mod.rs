@@ -10,7 +10,6 @@ use sha1::{Digest, Sha1};
 
 use crate::error::CloneError;
 use crate::pack::{ObjectId, ObjectReader, ObjectType};
-use crate::protocol::{RemoteRef, RemoteRefs};
 use crate::repo::RepoLayout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,28 +83,9 @@ pub struct CheckoutReport {
 pub fn materialize_default_branch(
     repo: &RepoLayout,
     object_reader: &dyn ObjectReader,
-    remote_refs: &RemoteRefs,
-    selected_refs: &[RemoteRef],
+    commit_oid: ObjectId,
 ) -> Result<CheckoutReport, CloneError> {
     let manifest_start = Instant::now();
-    let head_ref =
-        remote_refs
-            .default_branch
-            .as_deref()
-            .ok_or_else(|| CloneError::CheckoutFailed {
-                path: repo.root().to_owned(),
-                operation: "resolving default branch",
-                detail: "remote did not advertise a HEAD symref".to_owned(),
-            })?;
-    let head = selected_refs
-        .iter()
-        .find(|remote_ref| remote_ref.name == head_ref)
-        .ok_or_else(|| CloneError::CheckoutFailed {
-            path: repo.root().to_owned(),
-            operation: "resolving default branch",
-            detail: format!("HEAD points to `{head_ref}`, but that ref was not fetched"),
-        })?;
-    let commit_oid = ObjectId::parse_hex(&head.oid)?;
     let root_tree_oid = parse_commit_tree_oid(object_reader, commit_oid)?;
     let mut directories = Vec::new();
     let mut manifest = Vec::new();
@@ -143,63 +123,6 @@ pub fn materialize_default_branch(
     Ok(CheckoutReport {
         manifest_ms,
         dir_create_ms,
-        file_materialize_ms,
-        index_write_ms: index_start.elapsed().as_millis(),
-        file_count,
-        dir_count,
-        blob_bytes,
-    })
-}
-
-pub fn index_existing_default_branch(
-    repo: &RepoLayout,
-    object_reader: &dyn ObjectReader,
-    remote_refs: &RemoteRefs,
-    selected_refs: &[RemoteRef],
-) -> Result<CheckoutReport, CloneError> {
-    let manifest_start = Instant::now();
-    let head_ref =
-        remote_refs
-            .default_branch
-            .as_deref()
-            .ok_or_else(|| CloneError::CheckoutFailed {
-                path: repo.root().to_owned(),
-                operation: "resolving default branch",
-                detail: "remote did not advertise a HEAD symref".to_owned(),
-            })?;
-    let head = selected_refs
-        .iter()
-        .find(|remote_ref| remote_ref.name == head_ref)
-        .ok_or_else(|| CloneError::CheckoutFailed {
-            path: repo.root().to_owned(),
-            operation: "resolving default branch",
-            detail: format!("HEAD points to `{head_ref}`, but that ref was not fetched"),
-        })?;
-    let commit_oid = ObjectId::parse_hex(&head.oid)?;
-    let root_tree_oid = parse_commit_tree_oid(object_reader, commit_oid)?;
-    let mut directories = Vec::new();
-    let mut manifest = Vec::new();
-    collect_tree_manifest(
-        object_reader,
-        root_tree_oid,
-        Path::new(""),
-        &mut directories,
-        &mut manifest,
-    )?;
-    let manifest_ms = manifest_start.elapsed().as_millis();
-    let dir_count = directories.len();
-    let file_count = manifest.len();
-    let blob_bytes = manifest.iter().map(|entry| entry.size).sum();
-
-    let file_start = Instant::now();
-    let mut checkout_entries = index_existing_manifest(repo.root(), &manifest)?;
-    let file_materialize_ms = file_start.elapsed().as_millis();
-
-    let index_start = Instant::now();
-    write_git_index(&repo.git_index_path(), &mut checkout_entries)?;
-    Ok(CheckoutReport {
-        manifest_ms,
-        dir_create_ms: 0,
         file_materialize_ms,
         index_write_ms: index_start.elapsed().as_millis(),
         file_count,
@@ -325,31 +248,6 @@ fn materialize_manifest(
             .map(|entry| materialize_manifest_entry(root, entry, object_reader))
             .collect()
     }
-}
-
-fn index_existing_manifest(
-    root: &Path,
-    manifest: &[CheckoutManifestEntry],
-) -> Result<Vec<CheckoutEntry>, CloneError> {
-    manifest
-        .iter()
-        .map(|entry| {
-            let path = root.join(&entry.path);
-            let metadata =
-                fs::symlink_metadata(&path).map_err(|error| CloneError::CheckoutFailed {
-                    path: path.clone(),
-                    operation: "reading archive checkout metadata",
-                    detail: error.to_string(),
-                })?;
-            Ok(CheckoutEntry {
-                path: entry.path.clone(),
-                mode: entry.mode,
-                oid: entry.oid,
-                size: index_size(&entry.path, entry.size)?,
-                stat: FileStat::try_from_metadata(&path, &metadata)?,
-            })
-        })
-        .collect()
 }
 
 fn checkout_jobs() -> Result<Option<usize>, CloneError> {

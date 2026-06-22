@@ -391,11 +391,12 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIndex, Clo
     })?;
     let pack = Arc::<[u8]>::from(pack);
 
-    let scan = if env_bool("FCL_LOW_MEMORY") {
-        scan_pack_metadata(pack_path, pack.as_ref())?
+    let scan_payload = if env_bool("FCL_LOW_MEMORY") {
+        ScanPayload::MetadataOnly
     } else {
-        scan_and_inflate_pack(pack_path, pack.as_ref())?
+        ScanPayload::Inflate
     };
+    let scan = scan_pack(pack_path, pack.as_ref(), scan_payload)?;
     let resolved = resolve_inflated_frames(pack_path, pack.as_ref(), &scan.frames)?;
     let mut entries = resolved
         .iter()
@@ -548,7 +549,13 @@ fn optional_usize_env(name: &'static str) -> Result<Option<usize>, CloneError> {
     Ok(Some(value))
 }
 
-fn scan_and_inflate_pack(pack_path: &Path, pack: &[u8]) -> Result<PackScan, CloneError> {
+#[derive(Debug, Clone, Copy)]
+enum ScanPayload {
+    Inflate,
+    MetadataOnly,
+}
+
+fn scan_pack(pack_path: &Path, pack: &[u8], payload: ScanPayload) -> Result<PackScan, CloneError> {
     let checksum = validate_pack(pack_path, pack)?;
     let version = u32::from_be_bytes([pack[4], pack[5], pack[6], pack[7]]);
     if version != 2 && version != 3 {
@@ -605,8 +612,14 @@ fn scan_and_inflate_pack(pack_path: &Path, pack: &[u8]) -> Result<PackScan, Clon
         };
 
         let compressed_start = offset;
-        let (inflated, compressed_len) =
-            inflate_next_frame(pack_path, pack, offset, declared_size)?;
+        let (inflated, compressed_len) = match payload {
+            ScanPayload::Inflate => {
+                let (inflated, compressed_len) =
+                    inflate_next_frame(pack_path, pack, offset, declared_size)?;
+                (Some(inflated), compressed_len)
+            }
+            ScanPayload::MetadataOnly => (None, scan_zlib_stream_len(pack_path, pack, offset)?),
+        };
         offset += compressed_len;
         if offset > pack.len() - 20 {
             return Err(CloneError::PackIndexFailed {
@@ -615,7 +628,6 @@ fn scan_and_inflate_pack(pack_path: &Path, pack: &[u8]) -> Result<PackScan, Clon
                 detail: format!("object at offset {object_start} overlaps the pack trailer"),
             });
         }
-
         let mut crc = Crc32::new();
         crc.update(&pack[object_start..offset]);
         frames.push(ObjectFrame {
@@ -624,7 +636,7 @@ fn scan_and_inflate_pack(pack_path: &Path, pack: &[u8]) -> Result<PackScan, Clon
             compressed_len,
             crc32: crc.finalize(),
             encoded,
-            inflated: Some(inflated),
+            inflated,
             declared_size,
         });
     }
@@ -633,92 +645,6 @@ fn scan_and_inflate_pack(pack_path: &Path, pack: &[u8]) -> Result<PackScan, Clon
         return Err(CloneError::PackIndexFailed {
             path: pack_path.to_owned(),
             operation: "scanning pack",
-            detail: format!(
-                "scan ended at offset {offset}, expected trailer at {}",
-                pack.len() - 20
-            ),
-        });
-    }
-
-    Ok(PackScan { checksum, frames })
-}
-
-fn scan_pack_metadata(pack_path: &Path, pack: &[u8]) -> Result<PackScan, CloneError> {
-    let checksum = validate_pack(pack_path, pack)?;
-    let version = u32::from_be_bytes([pack[4], pack[5], pack[6], pack[7]]);
-    if version != 2 && version != 3 {
-        return Err(CloneError::PackIndexFailed {
-            path: pack_path.to_owned(),
-            operation: "parsing pack header",
-            detail: format!("unsupported pack version {version}"),
-        });
-    }
-
-    let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
-    enforce_max_objects(count)?;
-    let mut offset = 12usize;
-    let mut frames = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        let object_start = offset;
-        let (kind_id, declared_size, next_offset) = parse_object_header(pack_path, pack, offset)?;
-        offset = next_offset;
-
-        let encoded = match kind_id {
-            1 => EncodedObjectKind::Base(ObjectType::Commit),
-            2 => EncodedObjectKind::Base(ObjectType::Tree),
-            3 => EncodedObjectKind::Base(ObjectType::Blob),
-            4 => EncodedObjectKind::Base(ObjectType::Tag),
-            6 => {
-                let (base_offset, next_offset) =
-                    parse_offset_delta_base(pack_path, pack, object_start, offset)?;
-                offset = next_offset;
-                EncodedObjectKind::OffsetDelta { base_offset }
-            }
-            7 => {
-                if pack.len() - offset < 20 {
-                    return Err(CloneError::PackIndexFailed {
-                        path: pack_path.to_owned(),
-                        operation: "parsing ref delta base",
-                        detail: format!(
-                            "ref delta at offset {object_start} has a truncated base oid"
-                        ),
-                    });
-                }
-                let mut base_oid = [0u8; 20];
-                base_oid.copy_from_slice(&pack[offset..offset + 20]);
-                offset += 20;
-                EncodedObjectKind::RefDelta { base_oid }
-            }
-            other => {
-                return Err(CloneError::PackIndexFailed {
-                    path: pack_path.to_owned(),
-                    operation: "parsing object header",
-                    detail: format!("object at offset {object_start} used unknown type {other}"),
-                });
-            }
-        };
-
-        let compressed_start = offset;
-        let compressed_len = scan_zlib_stream_len(pack_path, pack, offset)?;
-        offset += compressed_len;
-        let mut crc = Crc32::new();
-        crc.update(&pack[object_start..offset]);
-        frames.push(ObjectFrame {
-            offset: object_start as u64,
-            compressed_start,
-            compressed_len,
-            crc32: crc.finalize(),
-            encoded,
-            inflated: None,
-            declared_size,
-        });
-    }
-
-    if offset != pack.len() - 20 {
-        return Err(CloneError::PackIndexFailed {
-            path: pack_path.to_owned(),
-            operation: "scanning pack metadata",
             detail: format!(
                 "scan ended at offset {offset}, expected trailer at {}",
                 pack.len() - 20
@@ -885,7 +811,10 @@ fn inflate_next_frame(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps delta scheduling state in one place"
+)]
 fn resolve_inflated_frames(
     pack_path: &Path,
     pack: &[u8],

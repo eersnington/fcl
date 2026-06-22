@@ -65,10 +65,11 @@ impl RepoLayout {
         &self,
         remote: &Remote,
         refs: &[RemoteRef],
+        default_branch: &str,
     ) -> Result<(), CloneError> {
         self.write_config(&remote.url)?;
-        self.write_head(remote.refs.default_branch.as_deref())?;
-        self.write_refs(refs, remote.refs.default_branch.as_deref())
+        self.write_head(default_branch)?;
+        self.write_refs(refs, default_branch)
     }
 
     fn write_config(&self, url: &str) -> Result<(), CloneError> {
@@ -80,24 +81,19 @@ impl RepoLayout {
             .map_err(|source| CloneError::repo_layout(path, "writing .git/config", source))
     }
 
-    fn write_head(&self, default_branch: Option<&str>) -> Result<(), CloneError> {
+    fn write_head(&self, default_branch: &str) -> Result<(), CloneError> {
         let path = self.root.join(".git/HEAD");
-        let head = default_branch.unwrap_or("refs/heads/main");
-        let content = format!("ref: {head}\n");
+        let content = format!("ref: {default_branch}\n");
         fs::write(&path, content)
             .map_err(|source| CloneError::repo_layout(path, "writing HEAD", source))
     }
 
-    fn write_refs(
-        &self,
-        refs: &[RemoteRef],
-        default_branch: Option<&str>,
-    ) -> Result<(), CloneError> {
+    fn write_refs(&self, refs: &[RemoteRef], default_branch: &str) -> Result<(), CloneError> {
         for remote_ref in refs {
             if let Some(branch) = remote_ref.name.strip_prefix("refs/heads/") {
                 let path = self.root.join(".git/refs/remotes/origin").join(branch);
                 write_ref(&path, &remote_ref.oid)?;
-                if default_branch == Some(remote_ref.name.as_str()) {
+                if default_branch == remote_ref.name {
                     let path = self.root.join(".git/refs/heads").join(branch);
                     write_ref(&path, &remote_ref.oid)?;
                 }
