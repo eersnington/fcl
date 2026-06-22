@@ -1,0 +1,20 @@
+[package]
+name = "fcl-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32fast = "1.5.0"
+flate2 = "1.1.5"
+hex = "0.4.3"
+memory-stats = "1.2.0"
+rayon = "1.11.0"
+reflink-copy = "0.1.30"
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "hickory-dns", "rustls-tls"] }
+sha1 = "0.10.6"
+tar = "0.4.44"
+thiserror = "2.0.16"
+url = "2.5.7"
+
+[lints]
+workspace = true
