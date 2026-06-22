@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -9,6 +9,7 @@ use sha1::{Digest, Sha1};
 use url::Url;
 
 use crate::error::CloneError;
+use crate::pack::{PackScan, StreamingPackScanner};
 use crate::protocol::pkt_line::{
     Packet, encode_data, encode_delimiter, encode_flush, parse_packets,
 };
@@ -45,6 +46,13 @@ pub struct Remote {
     pub url: String,
     pub upload_pack_url: String,
     pub refs: RemoteRefs,
+}
+
+pub struct FetchedPack {
+    pub bytes: u64,
+    pub checksum: [u8; 20],
+    pub scan: Option<PackScan>,
+    pub scan_ms: u128,
 }
 
 pub fn http_client() -> Result<Client, CloneError> {
@@ -106,7 +114,7 @@ pub fn fetch_full_pack(
     remote: &Remote,
     refs: &[RemoteRef],
     pack_path: &Path,
-) -> Result<u64, CloneError> {
+) -> Result<FetchedPack, CloneError> {
     let mut body = Vec::new();
     encode_data("command=fetch\n", &mut body);
     encode_data("agent=fcl/0.1\n", &mut body);
@@ -153,12 +161,12 @@ pub fn fetch_full_pack(
         env_usize("FCL_PACK_WRITE_BUFFER", DEFAULT_PACK_WRITE_BUFFER),
         file,
     );
-    let pack_bytes = write_sideband_pack(&remote.url, pack_path, &mut response, &mut file)?;
+    let fetched_pack = write_sideband_pack(&remote.url, pack_path, &mut response, &mut file)?;
     file.flush().map_err(|source| CloneError::PackWriteFailed {
         path: pack_path.to_owned(),
         source,
     })?;
-    Ok(pack_bytes)
+    Ok(fetched_pack)
 }
 
 fn parse_https_url(raw_url: &str) -> Result<Url, CloneError> {
@@ -328,9 +336,12 @@ fn write_sideband_pack(
     pack_path: &Path,
     response: &mut impl Read,
     file: &mut impl Write,
-) -> Result<u64, CloneError> {
+) -> Result<FetchedPack, CloneError> {
     let mut pack_bytes = 0u64;
     let mut hasher = PackTrailerHasher::new();
+    let max_pack_bytes = optional_u64_env("FCL_MAX_PACK_BYTES")?;
+    let mut scanner = env_bool("FCL_STREAM_SCAN").then(|| StreamingPackScanner::new(pack_path));
+    let mut scan_duration = Duration::ZERO;
 
     loop {
         let packet = read_packet(raw_url, response)?;
@@ -351,7 +362,13 @@ fn write_sideband_pack(
                         source,
                     })?;
                 pack_bytes += payload.len() as u64;
+                enforce_max_pack_bytes(max_pack_bytes, pack_bytes)?;
                 hasher.update(payload);
+                if let Some(scanner) = scanner.as_mut() {
+                    let scan_start = Instant::now();
+                    scanner.feed(payload)?;
+                    scan_duration += scan_start.elapsed();
+                }
             }
             2 => {}
             3 => {
@@ -371,9 +388,17 @@ fn write_sideband_pack(
         }
     }
 
-    validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    let checksum = validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    let scan = scanner
+        .map(|scanner| scanner.finish(checksum))
+        .transpose()?;
 
-    Ok(pack_bytes)
+    Ok(FetchedPack {
+        bytes: pack_bytes,
+        checksum,
+        scan,
+        scan_ms: scan_duration.as_millis(),
+    })
 }
 
 fn read_packet(raw_url: &str, reader: &mut impl Read) -> Result<Option<Vec<u8>>, CloneError> {
@@ -441,15 +466,50 @@ impl PackTrailerHasher {
     }
 
     fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.len + bytes.len() <= 20 {
+            self.trailer[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            return;
+        }
+
+        let mut bytes = bytes;
+        if self.len < 20 {
+            let needed = 20 - self.len;
+            self.trailer[self.len..20].copy_from_slice(&bytes[..needed]);
+            self.len = 20;
+            bytes = &bytes[needed..];
+        }
+
+        if bytes.len() >= 20 {
+            let hash_len = bytes.len() - 20;
+            self.flush_trailer();
+            self.hasher.update(&bytes[..hash_len]);
+            self.trailer.copy_from_slice(&bytes[hash_len..]);
+            self.cursor = 0;
+            return;
+        }
+
+        for &byte in bytes {
             if self.len < 20 {
-                self.trailer[self.len] = *byte;
+                self.trailer[self.len] = byte;
                 self.len += 1;
             } else {
                 self.hasher.update([self.trailer[self.cursor]]);
-                self.trailer[self.cursor] = *byte;
+                self.trailer[self.cursor] = byte;
                 self.cursor = (self.cursor + 1) % 20;
             }
+        }
+    }
+
+    fn flush_trailer(&mut self) {
+        if self.cursor == 0 {
+            self.hasher.update(self.trailer);
+        } else {
+            self.hasher.update(&self.trailer[self.cursor..]);
+            self.hasher.update(&self.trailer[..self.cursor]);
         }
     }
 
@@ -473,7 +533,7 @@ fn validate_streaming_pack_checksum(
     pack_path: &Path,
     pack_bytes: u64,
     hasher: PackTrailerHasher,
-) -> Result<(), CloneError> {
+) -> Result<[u8; 20], CloneError> {
     let Some((trailer, actual)) = hasher.finish() else {
         return Err(CloneError::MalformedRemoteResponse {
             url: raw_url.to_owned(),
@@ -495,7 +555,35 @@ fn validate_streaming_pack_checksum(
             actual: hex::encode(actual),
         });
     }
+    Ok(trailer)
+}
+
+fn enforce_max_pack_bytes(max_pack_bytes: Option<u64>, actual: u64) -> Result<(), CloneError> {
+    if let Some(max_pack_bytes) = max_pack_bytes
+        && actual > max_pack_bytes
+    {
+        return Err(CloneError::CloneLimitExceeded {
+            operation: "receiving pack data",
+            detail: format!(
+                "FCL_MAX_PACK_BYTES is {max_pack_bytes} bytes, but received pack data reached {actual} bytes"
+            ),
+        });
+    }
     Ok(())
+}
+
+fn optional_u64_env(name: &'static str) -> Result<Option<u64>, CloneError> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy();
+    let value = raw
+        .parse::<u64>()
+        .map_err(|error| CloneError::CloneLimitExceeded {
+            operation: "parsing clone safety limit",
+            detail: format!("{name} must be an unsigned byte count, got `{raw}`: {error}"),
+        })?;
+    Ok(Some(value))
 }
 
 fn unique_oids(refs: &[RemoteRef]) -> Vec<&str> {

@@ -12,6 +12,7 @@ pub struct CloneReport {
     pub pack_resolve_ms: u128,
     pub pack_idx_write_ms: u128,
     pub pack_object_state_ms: u128,
+    pub streaming_pack_scan: bool,
     pub checkout_ms: u128,
     pub checkout_manifest_ms: u128,
     pub checkout_dir_create_ms: u128,

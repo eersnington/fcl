@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use fcl_core::{CloneError, CloneReport, CloneRequest, clone_repo};
 
 #[derive(Debug, Parser)]
@@ -20,12 +20,27 @@ pub struct BenchCli {
     #[arg(long)]
     pub compare_git: bool,
 
+    /// Order to run tools when comparing fcl with git.
+    #[arg(long, value_enum, default_value_t = BenchOrder::Alternate)]
+    pub order: BenchOrder,
+
+    /// Capture Git Trace2 perf output during timed git clone runs.
+    #[arg(long)]
+    pub git_trace2: bool,
+
     /// Validate each cloned repository with git fsck/status/diff.
     #[arg(long)]
     pub validate: bool,
 
     #[command(flatten)]
     pub output: BenchOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BenchOrder {
+    FclFirst,
+    GitFirst,
+    Alternate,
 }
 
 #[derive(Debug, Parser)]
@@ -51,6 +66,7 @@ struct BenchResult {
     pack_resolve_ms: Option<u128>,
     pack_idx_write_ms: Option<u128>,
     pack_object_state_ms: Option<u128>,
+    streaming_pack_scan: Option<bool>,
     checkout_ms: Option<u128>,
     checkout_manifest_ms: Option<u128>,
     checkout_dir_create_ms: Option<u128>,
@@ -82,70 +98,109 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
 
     if cli.output.csv {
         println!(
-            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,reconstructed_object_count,target_bytes,rss_bytes,git_trace_path,validated"
+            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,reconstructed_object_count,target_bytes,rss_bytes,git_trace_path,validated"
         );
     }
 
     let mut results = Vec::new();
     for run in 1..=cli.runs {
-        let target = bench_target("fcl", run);
-        remove_target(&target)?;
-        let report = clone_repo(CloneRequest::new(cli.url.clone(), Some(target.clone())))?;
-        if cli.validate {
-            validate_repo(&target)?;
+        if cli.compare_git && run_git_first(cli.order, run) {
+            run_git_bench(cli, run, &mut results)?;
         }
-        let result = BenchResult::from_fcl(run, &report, cli.validate);
-        print_result(cli, &result);
-        results.push(result);
 
-        if cli.compare_git {
-            let target = bench_target("git", run);
-            remove_target(&target)?;
-            let start = Instant::now();
-            let trace_path = git_trace_path(run);
-            run_git_clone(&cli.url, &target, &trace_path)?;
-            let total_ms = start.elapsed().as_millis();
-            if cli.validate {
-                validate_repo(&target)?;
-            }
-            let result = BenchResult {
-                tool: "git",
-                run,
-                total_ms,
-                discovery_ms: None,
-                fetch_ms: None,
-                ingest_ms: None,
-                pack_scan_ms: None,
-                pack_resolve_ms: None,
-                pack_idx_write_ms: None,
-                pack_object_state_ms: None,
-                checkout_ms: None,
-                checkout_manifest_ms: None,
-                checkout_dir_create_ms: None,
-                checkout_file_materialize_ms: None,
-                checkout_index_write_ms: None,
-                checkout_file_count: None,
-                checkout_dir_count: None,
-                checkout_blob_bytes: None,
-                pack_bytes: None,
-                ref_count: None,
-                retained_object_count: None,
-                retained_object_bytes: None,
-                spilled_object_count: None,
-                spilled_object_bytes: None,
-                reconstructed_object_count: None,
-                target_bytes: target_size(&target).ok(),
-                rss_bytes: None,
-                git_trace_path: Some(trace_path),
-                validated: cli.validate,
-            };
-            print_result(cli, &result);
-            results.push(result);
+        run_fcl_bench(cli, run, &mut results)?;
+
+        if cli.compare_git && !run_git_first(cli.order, run) {
+            run_git_bench(cli, run, &mut results)?;
         }
     }
 
     print_summaries(cli, &results);
 
+    Ok(())
+}
+
+const fn run_git_first(order: BenchOrder, run: usize) -> bool {
+    match order {
+        BenchOrder::FclFirst => false,
+        BenchOrder::GitFirst => true,
+        BenchOrder::Alternate => run.is_multiple_of(2),
+    }
+}
+
+fn run_fcl_bench(
+    cli: &BenchCli,
+    run: usize,
+    results: &mut Vec<BenchResult>,
+) -> Result<(), CloneError> {
+    let target = bench_target("fcl", run);
+    remove_target(&target)?;
+    let report = clone_repo(CloneRequest::new(cli.url.clone(), Some(target.clone())))?;
+    if cli.validate {
+        validate_repo(&target)?;
+    }
+    let result = BenchResult::from_fcl(run, &report, cli.validate);
+    print_result(cli, &result);
+    results.push(result);
+    Ok(())
+}
+
+fn run_git_bench(
+    cli: &BenchCli,
+    run: usize,
+    results: &mut Vec<BenchResult>,
+) -> Result<(), CloneError> {
+    let target = bench_target("git", run);
+    remove_target(&target)?;
+    let trace_path = cli.git_trace2.then(|| git_trace_path(run));
+    if let Some(trace_path) = &trace_path
+        && trace_path.exists()
+    {
+        fs::remove_file(trace_path).map_err(|error| CloneError::BenchmarkFailed {
+            operation: "removing previous git trace",
+            detail: format!("{}: {error}", trace_path.display()),
+        })?;
+    }
+    let start = Instant::now();
+    run_git_clone(&cli.url, &target, trace_path.as_deref())?;
+    let total_ms = start.elapsed().as_millis();
+    if cli.validate {
+        validate_repo(&target)?;
+    }
+    let result = BenchResult {
+        tool: "git",
+        run,
+        total_ms,
+        discovery_ms: None,
+        fetch_ms: None,
+        ingest_ms: None,
+        pack_scan_ms: None,
+        pack_resolve_ms: None,
+        pack_idx_write_ms: None,
+        pack_object_state_ms: None,
+        streaming_pack_scan: None,
+        checkout_ms: None,
+        checkout_manifest_ms: None,
+        checkout_dir_create_ms: None,
+        checkout_file_materialize_ms: None,
+        checkout_index_write_ms: None,
+        checkout_file_count: None,
+        checkout_dir_count: None,
+        checkout_blob_bytes: None,
+        pack_bytes: None,
+        ref_count: None,
+        retained_object_count: None,
+        retained_object_bytes: None,
+        spilled_object_count: None,
+        spilled_object_bytes: None,
+        reconstructed_object_count: None,
+        target_bytes: target_size(&target).ok(),
+        rss_bytes: None,
+        git_trace_path: trace_path,
+        validated: cli.validate,
+    };
+    print_result(cli, &result);
+    results.push(result);
     Ok(())
 }
 
@@ -162,6 +217,7 @@ impl BenchResult {
             pack_resolve_ms: Some(report.pack_resolve_ms),
             pack_idx_write_ms: Some(report.pack_idx_write_ms),
             pack_object_state_ms: Some(report.pack_object_state_ms),
+            streaming_pack_scan: Some(report.streaming_pack_scan),
             checkout_ms: Some(report.checkout_ms),
             checkout_manifest_ms: Some(report.checkout_manifest_ms),
             checkout_dir_create_ms: Some(report.checkout_dir_create_ms),
@@ -235,9 +291,12 @@ fn git_trace_path(run: usize) -> PathBuf {
         .join(format!("git-trace-{run}.txt"))
 }
 
-fn run_git_clone(url: &str, target: &Path, trace_path: &Path) -> Result<(), CloneError> {
-    let output = Command::new("git")
-        .env("GIT_TRACE_PERFORMANCE", "1")
+fn run_git_clone(url: &str, target: &Path, trace_path: Option<&Path>) -> Result<(), CloneError> {
+    let mut command = Command::new("git");
+    if let Some(trace_path) = trace_path {
+        command.env("GIT_TRACE2_PERF", trace_path);
+    }
+    let output = command
         .arg("clone")
         .arg(url)
         .arg(target)
@@ -246,10 +305,14 @@ fn run_git_clone(url: &str, target: &Path, trace_path: &Path) -> Result<(), Clon
             operation: "running git clone",
             detail: error.to_string(),
         })?;
-    fs::write(trace_path, &output.stderr).map_err(|error| CloneError::BenchmarkFailed {
-        operation: "writing git performance trace",
-        detail: format!("{}: {error}", trace_path.display()),
-    })?;
+    if let Some(trace_path) = trace_path
+        && !trace_path.exists()
+    {
+        fs::write(trace_path, &output.stderr).map_err(|error| CloneError::BenchmarkFailed {
+            operation: "writing git performance trace",
+            detail: format!("{}: {error}", trace_path.display()),
+        })?;
+    }
     if !output.status.success() {
         return Err(CloneError::BenchmarkFailed {
             operation: "running git clone",
@@ -302,7 +365,7 @@ fn print_result(cli: &BenchCli, result: &BenchResult) {
 
 fn print_json_result(url: &str, result: &BenchResult) {
     println!(
-        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"validated\":{}}}",
+        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"validated\":{}}}",
         escape_json(url),
         result.tool,
         result.run,
@@ -314,6 +377,7 @@ fn print_json_result(url: &str, result: &BenchResult) {
         option_u128(result.pack_resolve_ms),
         option_u128(result.pack_idx_write_ms),
         option_u128(result.pack_object_state_ms),
+        option_bool(result.streaming_pack_scan),
         option_u128(result.checkout_ms),
         option_u128(result.checkout_manifest_ms),
         option_u128(result.checkout_dir_create_ms),
@@ -338,7 +402,7 @@ fn print_json_result(url: &str, result: &BenchResult) {
 
 fn print_csv_result(url: &str, result: &BenchResult) {
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         url,
         result.tool,
         result.run,
@@ -350,6 +414,7 @@ fn print_csv_result(url: &str, result: &BenchResult) {
         csv_u128(result.pack_resolve_ms),
         csv_u128(result.pack_idx_write_ms),
         csv_u128(result.pack_object_state_ms),
+        csv_bool(result.streaming_pack_scan),
         csv_u128(result.checkout_ms),
         csv_u128(result.checkout_manifest_ms),
         csv_u128(result.checkout_dir_create_ms),
@@ -374,7 +439,7 @@ fn print_csv_result(url: &str, result: &BenchResult) {
 
 fn print_plain_result(result: &BenchResult) {
     println!(
-        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} reconstructed_objects={} target_bytes={} rss={} git_trace={} validated={}",
+        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} reconstructed_objects={} target_bytes={} rss={} git_trace={} validated={}",
         result.tool,
         result.run,
         result.total_ms,
@@ -385,6 +450,7 @@ fn print_plain_result(result: &BenchResult) {
         ms_or_dash(result.pack_resolve_ms),
         ms_or_dash(result.pack_idx_write_ms),
         ms_or_dash(result.pack_object_state_ms),
+        bool_or_dash(result.streaming_pack_scan),
         ms_or_dash(result.checkout_ms),
         ms_or_dash(result.checkout_manifest_ms),
         ms_or_dash(result.checkout_dir_create_ms),
@@ -469,6 +535,10 @@ fn option_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "null".to_owned(), |value| value.to_string())
 }
 
+fn option_bool(value: Option<bool>) -> String {
+    value.map_or_else(|| "null".to_owned(), |value| value.to_string())
+}
+
 fn option_path(value: Option<&Path>) -> String {
     value.map_or_else(
         || "null".to_owned(),
@@ -488,6 +558,10 @@ fn csv_usize(value: Option<usize>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
 }
 
+fn csv_bool(value: Option<bool>) -> String {
+    value.map_or_else(String::new, |value| value.to_string())
+}
+
 fn csv_path(value: Option<&Path>) -> String {
     value.map_or_else(String::new, |value| value.display().to_string())
 }
@@ -504,6 +578,10 @@ fn usize_or_dash(value: Option<usize>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.to_string())
 }
 
+fn bool_or_dash(value: Option<bool>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
 fn path_or_dash(value: Option<&Path>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.display().to_string())
 }
@@ -514,7 +592,7 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TimingSummary, csv_path, option_path};
+    use super::{BenchOrder, TimingSummary, csv_path, option_path, run_git_first};
     use std::path::Path;
 
     #[test]
@@ -542,6 +620,14 @@ mod tests {
     #[test]
     fn timing_summary_should_reject_empty_samples() {
         assert_eq!(TimingSummary::from_samples(&[]), None);
+    }
+
+    #[test]
+    fn benchmark_order_should_support_fixed_and_alternating_git_position() {
+        assert!(!run_git_first(BenchOrder::FclFirst, 1));
+        assert!(run_git_first(BenchOrder::GitFirst, 1));
+        assert!(!run_git_first(BenchOrder::Alternate, 1));
+        assert!(run_git_first(BenchOrder::Alternate, 2));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -339,28 +339,28 @@ fn read_spilled_object(path: &Path, len: u64) -> Result<Arc<[u8]>, CloneError> {
     Ok(data.into())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum EncodedObjectKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedObjectKind {
     Base(ObjectType),
     OffsetDelta { base_offset: u64 },
     RefDelta { base_oid: [u8; 20] },
 }
 
 #[derive(Debug, Clone)]
-struct ObjectFrame {
-    offset: u64,
-    compressed_start: usize,
-    compressed_len: usize,
-    crc32: u32,
-    encoded: EncodedObjectKind,
-    inflated: Option<Arc<[u8]>>,
-    declared_size: u64,
+pub struct ObjectFrame {
+    pub offset: u64,
+    pub compressed_start: usize,
+    pub compressed_len: usize,
+    pub crc32: u32,
+    pub encoded: EncodedObjectKind,
+    pub inflated: Option<Arc<[u8]>>,
+    pub declared_size: u64,
 }
 
 #[derive(Debug)]
-struct PackScan {
-    checksum: [u8; 20],
-    frames: Vec<ObjectFrame>,
+pub struct PackScan {
+    pub checksum: [u8; 20],
+    pub frames: Vec<ObjectFrame>,
 }
 
 #[derive(Debug, Clone)]
@@ -393,13 +393,9 @@ struct DeltaAdjacency {
     delta_count: usize,
 }
 
+#[cfg(test)]
 pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIngestReport, CloneError> {
-    let pack = fs::read(pack_path).map_err(|error| CloneError::PackIndexFailed {
-        path: pack_path.to_owned(),
-        operation: "reading pack file",
-        detail: error.to_string(),
-    })?;
-    let pack = Arc::<[u8]>::from(pack);
+    let pack = read_pack_arc(pack_path)?;
 
     let scan_payload = if env_bool("FCL_LOW_MEMORY") {
         ScanPayload::MetadataOnly
@@ -413,7 +409,35 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIngestRepo
     ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms)
 }
 
-fn ingest_scanned_pack(
+pub fn ingest_fetched_pack(
+    pack_path: &Path,
+    index_path: &Path,
+    checksum: [u8; 20],
+) -> Result<PackIngestReport, CloneError> {
+    let pack = read_pack_arc(pack_path)?;
+
+    let scan_payload = if env_bool("FCL_LOW_MEMORY") {
+        ScanPayload::MetadataOnly
+    } else {
+        ScanPayload::Inflate
+    };
+    let scan_start = Instant::now();
+    let scan = scan_pack_with_checksum(pack_path, pack.as_ref(), scan_payload, checksum)?;
+    let scan_ms = scan_start.elapsed().as_millis();
+
+    ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms)
+}
+
+pub fn read_pack_arc(pack_path: &Path) -> Result<Arc<[u8]>, CloneError> {
+    let pack = fs::read(pack_path).map_err(|error| CloneError::PackIndexFailed {
+        path: pack_path.to_owned(),
+        operation: "reading pack file",
+        detail: error.to_string(),
+    })?;
+    Ok(Arc::<[u8]>::from(pack))
+}
+
+pub fn ingest_scanned_pack(
     pack_path: &Path,
     index_path: &Path,
     pack: Arc<[u8]>,
@@ -587,13 +611,444 @@ fn optional_usize_env(name: &'static str) -> Result<Option<usize>, CloneError> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ScanPayload {
+pub enum ScanPayload {
     Inflate,
     MetadataOnly,
 }
 
+#[derive(Debug)]
+pub struct StreamingPackScanner {
+    pack_path: PathBuf,
+    state: ScannerState,
+    header: [u8; 12],
+    header_len: usize,
+    pack_offset: usize,
+    declared_objects: Option<usize>,
+    frames: Vec<ObjectFrame>,
+    current: Option<PartialObjectFrame>,
+    trailer_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScannerState {
+    PackHeader,
+    ObjectHeader,
+    OffsetDeltaBase,
+    RefDeltaBase,
+    CompressedPayload,
+    Trailer,
+}
+
+#[derive(Debug)]
+struct PartialObjectFrame {
+    object_start: usize,
+    kind_id: u8,
+    declared_size: u64,
+    size_shift: u32,
+    encoded: Option<EncodedObjectKind>,
+    compressed_start: usize,
+    compressed_len: usize,
+    crc32: Crc32,
+    offset_delta_distance: u64,
+    offset_delta_started: bool,
+    ref_delta_base_oid: [u8; 20],
+    ref_delta_base_len: usize,
+    decompressor: Decompress,
+}
+
+impl StreamingPackScanner {
+    pub fn new(pack_path: &Path) -> Self {
+        Self {
+            pack_path: pack_path.to_owned(),
+            state: ScannerState::PackHeader,
+            header: [0; 12],
+            header_len: 0,
+            pack_offset: 0,
+            declared_objects: None,
+            frames: Vec::new(),
+            current: None,
+            trailer_len: 0,
+        }
+    }
+
+    pub fn feed(&mut self, mut bytes: &[u8]) -> Result<(), CloneError> {
+        while !bytes.is_empty() {
+            match self.state {
+                ScannerState::PackHeader => self.feed_pack_header(&mut bytes)?,
+                ScannerState::ObjectHeader => self.feed_object_header(&mut bytes)?,
+                ScannerState::OffsetDeltaBase => self.feed_offset_delta_base(&mut bytes)?,
+                ScannerState::RefDeltaBase => self.feed_ref_delta_base(&mut bytes)?,
+                ScannerState::CompressedPayload => self.feed_compressed_payload(&mut bytes)?,
+                ScannerState::Trailer => {
+                    self.feed_trailer(bytes)?;
+                    bytes = &[];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self, checksum: [u8; 20]) -> Result<PackScan, CloneError> {
+        let Some(declared_objects) = self.declared_objects else {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path,
+                operation: "scanning pack",
+                detail: "pack header was incomplete".to_owned(),
+            });
+        };
+        if self.frames.len() != declared_objects {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path,
+                operation: "scanning pack",
+                detail: format!(
+                    "scanned {} objects but pack declared {declared_objects}",
+                    self.frames.len()
+                ),
+            });
+        }
+        if self.trailer_len != 20 {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path,
+                operation: "scanning pack",
+                detail: format!("pack trailer was {} bytes, expected 20", self.trailer_len),
+            });
+        }
+        Ok(PackScan {
+            checksum,
+            frames: self.frames,
+        })
+    }
+
+    fn feed_pack_header(&mut self, bytes: &mut &[u8]) -> Result<(), CloneError> {
+        let needed = self.header.len() - self.header_len;
+        let take = needed.min(bytes.len());
+        self.header[self.header_len..self.header_len + take].copy_from_slice(&bytes[..take]);
+        self.header_len += take;
+        self.pack_offset += take;
+        *bytes = &bytes[take..];
+        if self.header_len != self.header.len() {
+            return Ok(());
+        }
+        if &self.header[0..4] != b"PACK" {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "validating pack header",
+                detail: "file does not start with PACK".to_owned(),
+            });
+        }
+        let version = u32::from_be_bytes([
+            self.header[4],
+            self.header[5],
+            self.header[6],
+            self.header[7],
+        ]);
+        if version != 2 && version != 3 {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "parsing pack header",
+                detail: format!("unsupported pack version {version}"),
+            });
+        }
+        let count = u32::from_be_bytes([
+            self.header[8],
+            self.header[9],
+            self.header[10],
+            self.header[11],
+        ]) as usize;
+        enforce_max_objects(count)?;
+        self.declared_objects = Some(count);
+        self.frames = Vec::with_capacity(count);
+        self.state = if count == 0 {
+            ScannerState::Trailer
+        } else {
+            ScannerState::ObjectHeader
+        };
+        Ok(())
+    }
+
+    fn feed_object_header(&mut self, bytes: &mut &[u8]) -> Result<(), CloneError> {
+        let Some(byte) = take_byte(bytes) else {
+            return Ok(());
+        };
+        if self.current.is_none() {
+            let kind_id = (byte >> 4) & 0b111;
+            let mut crc32 = Crc32::new();
+            crc32.update(&[byte]);
+            self.current = Some(PartialObjectFrame {
+                object_start: self.pack_offset,
+                kind_id,
+                declared_size: u64::from(byte & 0b1111),
+                size_shift: 4,
+                encoded: None,
+                compressed_start: 0,
+                compressed_len: 0,
+                crc32,
+                offset_delta_distance: 0,
+                offset_delta_started: false,
+                ref_delta_base_oid: [0; 20],
+                ref_delta_base_len: 0,
+                decompressor: Decompress::new(true),
+            });
+        } else if let Some(current) = self.current.as_mut() {
+            current.crc32.update(&[byte]);
+            current.declared_size |= u64::from(byte & 0x7f) << current.size_shift;
+            current.size_shift += 7;
+        }
+        self.pack_offset += 1;
+        if byte & 0x80 != 0 {
+            return Ok(());
+        }
+        self.finish_object_header()
+    }
+
+    fn finish_object_header(&mut self) -> Result<(), CloneError> {
+        let current = self
+            .current
+            .as_mut()
+            .ok_or_else(|| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "parsing object header",
+                detail: "object header state was missing".to_owned(),
+            })?;
+        match current.kind_id {
+            1 => self.begin_compressed_payload(EncodedObjectKind::Base(ObjectType::Commit)),
+            2 => self.begin_compressed_payload(EncodedObjectKind::Base(ObjectType::Tree)),
+            3 => self.begin_compressed_payload(EncodedObjectKind::Base(ObjectType::Blob)),
+            4 => self.begin_compressed_payload(EncodedObjectKind::Base(ObjectType::Tag)),
+            6 => {
+                self.state = ScannerState::OffsetDeltaBase;
+                Ok(())
+            }
+            7 => {
+                self.state = ScannerState::RefDeltaBase;
+                Ok(())
+            }
+            other => Err(CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "parsing object header",
+                detail: format!(
+                    "object at offset {} used unknown type {other}",
+                    current.object_start
+                ),
+            }),
+        }
+    }
+
+    fn feed_offset_delta_base(&mut self, bytes: &mut &[u8]) -> Result<(), CloneError> {
+        let Some(byte) = take_byte(bytes) else {
+            return Ok(());
+        };
+        let current = self
+            .current
+            .as_mut()
+            .ok_or_else(|| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "parsing offset delta base",
+                detail: "offset delta state was missing".to_owned(),
+            })?;
+        current.crc32.update(&[byte]);
+        if current.offset_delta_started {
+            current.offset_delta_distance =
+                ((current.offset_delta_distance + 1) << 7) | u64::from(byte & 0x7f);
+        } else {
+            current.offset_delta_distance = u64::from(byte & 0x7f);
+            current.offset_delta_started = true;
+        }
+        self.pack_offset += 1;
+        if byte & 0x80 != 0 {
+            return Ok(());
+        }
+        let base_offset = (current.object_start as u64)
+            .checked_sub(current.offset_delta_distance)
+            .ok_or_else(|| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "parsing offset delta base",
+                detail: format!(
+                    "delta at offset {} points before the pack",
+                    current.object_start
+                ),
+            })?;
+        self.begin_compressed_payload(EncodedObjectKind::OffsetDelta { base_offset })
+    }
+
+    fn feed_ref_delta_base(&mut self, bytes: &mut &[u8]) -> Result<(), CloneError> {
+        let base_oid = {
+            let current = self
+                .current
+                .as_mut()
+                .ok_or_else(|| CloneError::PackIndexFailed {
+                    path: self.pack_path.clone(),
+                    operation: "parsing ref delta base",
+                    detail: "ref delta state was missing".to_owned(),
+                })?;
+            let needed = 20 - current.ref_delta_base_len;
+            let take = needed.min(bytes.len());
+            current.ref_delta_base_oid
+                [current.ref_delta_base_len..current.ref_delta_base_len + take]
+                .copy_from_slice(&bytes[..take]);
+            current.crc32.update(&bytes[..take]);
+            current.ref_delta_base_len += take;
+            self.pack_offset += take;
+            *bytes = &bytes[take..];
+            if current.ref_delta_base_len != 20 {
+                return Ok(());
+            }
+            current.ref_delta_base_oid
+        };
+        self.begin_compressed_payload(EncodedObjectKind::RefDelta { base_oid })
+    }
+
+    fn begin_compressed_payload(&mut self, encoded: EncodedObjectKind) -> Result<(), CloneError> {
+        let current = self
+            .current
+            .as_mut()
+            .ok_or_else(|| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "scanning object frame",
+                detail: "object state was missing".to_owned(),
+            })?;
+        current.encoded = Some(encoded);
+        current.compressed_start = self.pack_offset;
+        self.state = ScannerState::CompressedPayload;
+        Ok(())
+    }
+
+    fn feed_compressed_payload(&mut self, bytes: &mut &[u8]) -> Result<(), CloneError> {
+        let current = self
+            .current
+            .as_mut()
+            .ok_or_else(|| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "scanning compressed object",
+                detail: "compressed object state was missing".to_owned(),
+            })?;
+        let before_in = current.decompressor.total_in();
+        let before_out = current.decompressor.total_out();
+        let mut output = [0u8; 8192];
+        let status = current
+            .decompressor
+            .decompress(bytes, &mut output, FlushDecompress::None)
+            .map_err(|error| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "scanning compressed object",
+                detail: error.to_string(),
+            })?;
+        let consumed = usize_from_u64(
+            &self.pack_path,
+            "tracking compressed input",
+            current.decompressor.total_in() - before_in,
+        )?;
+        let inflated = current.decompressor.total_out() - before_out;
+        if consumed > 0 {
+            current.crc32.update(&bytes[..consumed]);
+            current.compressed_len += consumed;
+            self.pack_offset += consumed;
+            *bytes = &bytes[consumed..];
+        }
+        if status == Status::StreamEnd {
+            if current.decompressor.total_out() != current.declared_size {
+                return Err(CloneError::PackIndexFailed {
+                    path: self.pack_path.clone(),
+                    operation: "scanning compressed object",
+                    detail: format!(
+                        "object at offset {} inflated to {} bytes, expected {}",
+                        current.object_start,
+                        current.decompressor.total_out(),
+                        current.declared_size
+                    ),
+                });
+            }
+            self.finish_frame()?;
+            return Ok(());
+        }
+        if consumed == 0 && inflated == 0 {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "scanning compressed object",
+                detail: "decompressor made no progress".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_frame(&mut self) -> Result<(), CloneError> {
+        let current = self
+            .current
+            .take()
+            .ok_or_else(|| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "scanning object frame",
+                detail: "object state was missing".to_owned(),
+            })?;
+        let encoded = current.encoded.ok_or_else(|| CloneError::PackIndexFailed {
+            path: self.pack_path.clone(),
+            operation: "scanning object frame",
+            detail: "object encoding state was missing".to_owned(),
+        })?;
+        self.frames.push(ObjectFrame {
+            offset: current.object_start as u64,
+            compressed_start: current.compressed_start,
+            compressed_len: current.compressed_len,
+            crc32: current.crc32.finalize(),
+            encoded,
+            inflated: None,
+            declared_size: current.declared_size,
+        });
+        let declared_objects =
+            self.declared_objects
+                .ok_or_else(|| CloneError::PackIndexFailed {
+                    path: self.pack_path.clone(),
+                    operation: "scanning pack",
+                    detail: "pack object count was missing".to_owned(),
+                })?;
+        self.state = if self.frames.len() == declared_objects {
+            ScannerState::Trailer
+        } else {
+            ScannerState::ObjectHeader
+        };
+        Ok(())
+    }
+
+    fn feed_trailer(&mut self, bytes: &[u8]) -> Result<(), CloneError> {
+        self.trailer_len += bytes.len();
+        self.pack_offset += bytes.len();
+        if self.trailer_len > 20 {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "scanning pack",
+                detail: format!("pack trailer exceeded 20 bytes: {}", self.trailer_len),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn take_byte(bytes: &mut &[u8]) -> Option<u8> {
+    let (byte, rest) = bytes.split_first()?;
+    *bytes = rest;
+    Some(*byte)
+}
+
+#[cfg(test)]
 fn scan_pack(pack_path: &Path, pack: &[u8], payload: ScanPayload) -> Result<PackScan, CloneError> {
     let checksum = validate_pack(pack_path, pack)?;
+    scan_pack_with_checksum(pack_path, pack, payload, checksum)
+}
+
+fn scan_pack_with_checksum(
+    pack_path: &Path,
+    pack: &[u8],
+    payload: ScanPayload,
+    checksum: [u8; 20],
+) -> Result<PackScan, CloneError> {
+    validate_pack_header(pack_path, pack)?;
+    if pack[pack.len() - 20..] != checksum {
+        return Err(CloneError::PackChecksumMismatch {
+            path: pack_path.to_owned(),
+            expected: hex::encode(checksum),
+            actual: hex::encode(&pack[pack.len() - 20..]),
+        });
+    }
     let version = u32::from_be_bytes([pack[4], pack[5], pack[6], pack[7]]);
     if version != 2 && version != 3 {
         return Err(CloneError::PackIndexFailed {
@@ -692,14 +1147,9 @@ fn scan_pack(pack_path: &Path, pack: &[u8], payload: ScanPayload) -> Result<Pack
     Ok(PackScan { checksum, frames })
 }
 
+#[cfg(test)]
 fn validate_pack(pack_path: &Path, pack: &[u8]) -> Result<[u8; 20], CloneError> {
-    if pack.len() < 32 || &pack[0..4] != b"PACK" {
-        return Err(CloneError::PackIndexFailed {
-            path: pack_path.to_owned(),
-            operation: "validating pack header",
-            detail: "file does not start with PACK".to_owned(),
-        });
-    }
+    validate_pack_header(pack_path, pack)?;
     let expected = &pack[pack.len() - 20..];
     let actual = Sha1::digest(&pack[..pack.len() - 20]);
     if expected != actual.as_slice() {
@@ -712,6 +1162,17 @@ fn validate_pack(pack_path: &Path, pack: &[u8]) -> Result<[u8; 20], CloneError> 
     let mut checksum = [0u8; 20];
     checksum.copy_from_slice(expected);
     Ok(checksum)
+}
+
+fn validate_pack_header(pack_path: &Path, pack: &[u8]) -> Result<(), CloneError> {
+    if pack.len() < 32 || &pack[0..4] != b"PACK" {
+        return Err(CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "validating pack header",
+            detail: "file does not start with PACK".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_object_header(
@@ -1440,13 +1901,12 @@ fn usize_from_u64(path: &Path, operation: &'static str, value: u64) -> Result<us
 }
 
 fn validate_unique_objects(index_path: &Path, entries: &[IndexEntry]) -> Result<(), CloneError> {
-    let mut seen = HashSet::with_capacity(entries.len());
-    for entry in entries {
-        if !seen.insert(entry.oid) {
+    for window in entries.windows(2) {
+        if window[0].oid == window[1].oid {
             return Err(CloneError::PackIndexFailed {
                 path: index_path.to_owned(),
                 operation: "writing pack index",
-                detail: format!("duplicate object id {}", hex::encode(entry.oid)),
+                detail: format!("duplicate object id {}", hex::encode(window[0].oid)),
             });
         }
     }
@@ -1455,7 +1915,10 @@ fn validate_unique_objects(index_path: &Path, entries: &[IndexEntry]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{PackIndex, ScanPayload, ingest_pack, ingest_scanned_pack, scan_pack};
+    use super::{
+        EncodedObjectKind, PackIndex, ScanPayload, ingest_pack, ingest_scanned_pack, scan_pack,
+        validate_pack,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1504,6 +1967,42 @@ mod tests {
         fs::remove_dir_all(temp).expect("test temp directory should be removed");
     }
 
+    #[test]
+    fn streaming_pack_scanner_should_match_metadata_scan_for_chunk_boundaries() {
+        let temp = test_temp_dir("streaming-pack-scanner");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let expected = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+
+        for chunk_size in [1, 2, 3, 7, 8192, pack.len()] {
+            let actual = scan_streaming(&pack_path, &pack, chunk_size);
+            assert_same_scan_metadata(&expected, &actual, chunk_size);
+        }
+
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn streaming_pack_scanner_should_cover_offset_delta_frames() {
+        let temp = test_temp_dir("streaming-pack-offset-delta");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let actual = scan_streaming(&pack_path, &pack, 1);
+
+        assert!(
+            actual
+                .frames
+                .iter()
+                .any(|frame| matches!(frame.encoded, EncodedObjectKind::OffsetDelta { .. })),
+            "test pack should include at least one offset delta"
+        );
+
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
     fn test_temp_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1528,6 +2027,43 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn build_packed_test_repo(temp: &Path) -> PathBuf {
+        let repo = temp.join("repo");
+        fs::create_dir(&repo).expect("repo directory should be created");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "fcl test"]);
+        run_git(&repo, &["config", "user.email", "fcl@example.invalid"]);
+        for index in 0..12 {
+            fs::write(
+                repo.join("file.txt"),
+                format!("common prefix\nline {index}\ncommon suffix\n"),
+            )
+            .expect("file should be written");
+            fs::write(
+                repo.join(format!("similar-{index}.txt")),
+                format!("common prefix\nline {index}\ncommon suffix\n"),
+            )
+            .expect("similar file should be written");
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-m", &format!("commit {index}")]);
+        }
+        run_git(&repo, &["repack", "-ad", "--depth=50", "--window=50"]);
+        repo
+    }
+
+    fn scan_streaming(pack_path: &Path, pack: &[u8], chunk_size: usize) -> super::PackScan {
+        let checksum = validate_pack(pack_path, pack).expect("pack checksum should validate");
+        let mut scanner = super::StreamingPackScanner::new(pack_path);
+        for chunk in pack.chunks(chunk_size) {
+            scanner
+                .feed(chunk)
+                .expect("streaming scanner should accept chunk");
+        }
+        scanner
+            .finish(checksum)
+            .expect("streaming scanner should finish")
     }
 
     fn only_pack_path(repo: &Path) -> PathBuf {
@@ -1569,6 +2105,36 @@ mod tests {
             assert_eq!(left_meta.compressed_len, right_meta.compressed_len);
             assert_eq!(left_meta.crc32, right_meta.crc32);
             assert_eq!(left_meta.delta_base, right_meta.delta_base);
+        }
+    }
+
+    fn assert_same_scan_metadata(
+        left: &super::PackScan,
+        right: &super::PackScan,
+        chunk_size: usize,
+    ) {
+        assert_eq!(left.checksum, right.checksum, "chunk_size={chunk_size}");
+        assert_eq!(
+            left.frames.len(),
+            right.frames.len(),
+            "chunk_size={chunk_size}"
+        );
+        for (left, right) in left.frames.iter().zip(&right.frames) {
+            assert_eq!(left.offset, right.offset, "chunk_size={chunk_size}");
+            assert_eq!(
+                left.compressed_start, right.compressed_start,
+                "chunk_size={chunk_size}"
+            );
+            assert_eq!(
+                left.compressed_len, right.compressed_len,
+                "chunk_size={chunk_size}"
+            );
+            assert_eq!(left.crc32, right.crc32, "chunk_size={chunk_size}");
+            assert_eq!(left.encoded, right.encoded, "chunk_size={chunk_size}");
+            assert_eq!(
+                left.declared_size, right.declared_size,
+                "chunk_size={chunk_size}"
+            );
         }
     }
 }

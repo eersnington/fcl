@@ -89,21 +89,37 @@ impl RepoLayout {
     }
 
     fn write_refs(&self, refs: &[RemoteRef], default_branch: &str) -> Result<(), CloneError> {
+        let mut packed_refs = Vec::new();
         for remote_ref in refs {
             if let Some(branch) = remote_ref.name.strip_prefix("refs/heads/") {
-                let path = self.root.join(".git/refs/remotes/origin").join(branch);
-                write_ref(&path, &remote_ref.oid)?;
+                packed_refs.push((
+                    format!("refs/remotes/origin/{branch}"),
+                    remote_ref.oid.as_str(),
+                ));
                 if default_branch == remote_ref.name {
                     let path = self.root.join(".git/refs/heads").join(branch);
                     write_ref(&path, &remote_ref.oid)?;
                 }
             } else if let Some(tag) = remote_ref.name.strip_prefix("refs/tags/") {
-                let path = self.root.join(".git/refs/tags").join(tag);
-                write_ref(&path, &remote_ref.oid)?;
+                packed_refs.push((format!("refs/tags/{tag}"), remote_ref.oid.as_str()));
             }
         }
+        write_packed_refs(&self.root.join(".git/packed-refs"), packed_refs)?;
         Ok(())
     }
+}
+
+fn write_packed_refs(path: &Path, mut refs: Vec<(String, &str)>) -> Result<(), CloneError> {
+    refs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut content = String::from("# pack-refs with: sorted\n");
+    for (name, oid) in refs {
+        content.push_str(oid);
+        content.push(' ');
+        content.push_str(&name);
+        content.push('\n');
+    }
+    fs::write(path, content)
+        .map_err(|source| CloneError::repo_layout(path.to_owned(), "writing packed-refs", source))
 }
 
 fn write_ref(path: &Path, oid: &str) -> Result<(), CloneError> {

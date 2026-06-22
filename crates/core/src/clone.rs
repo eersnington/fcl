@@ -7,7 +7,7 @@ use url::Url;
 use crate::checkout::materialize_default_branch;
 use crate::error::CloneError;
 use crate::metrics::{CloneReport, measure_ms};
-use crate::pack::{ObjectId, ingest_pack};
+use crate::pack::{ObjectId, ingest_fetched_pack, ingest_scanned_pack, read_pack_arc};
 use crate::protocol::{discover_remote, fetch_full_pack, http_client};
 use crate::repo::RepoLayout;
 
@@ -38,22 +38,38 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         None => default_target_dir(&request.url)?,
     };
     let repo = RepoLayout::create(&target)?;
+    let max_temp_bytes = optional_u64_env("FCL_MAX_TEMP_BYTES")?;
 
-    let (pack_bytes, fetch_ms) =
+    let (fetched_pack, fetch_ms) =
         measure_ms(|| fetch_full_pack(&client, &remote, &refs, &repo.pack_temp_path()));
-    let pack_bytes = pack_bytes?;
-    enforce_max_bytes(
+    let fetched_pack = fetched_pack?;
+    let pack_bytes = fetched_pack.bytes;
+    enforce_optional_max_bytes(
         "FCL_MAX_PACK_BYTES",
+        optional_u64_env("FCL_MAX_PACK_BYTES")?,
         pack_bytes,
         "checking fetched pack size",
     )?;
-    enforce_max_bytes(
-        "FCL_MAX_TEMP_BYTES",
-        directory_bytes(repo.root())?,
-        "checking target size after fetch",
-    )?;
-    let (ingest_report, ingest_ms) =
-        measure_ms(|| ingest_pack(&repo.pack_temp_path(), &repo.pack_index_temp_path()));
+    enforce_target_size_limit(max_temp_bytes, &repo, "checking target size after fetch")?;
+    let streaming_pack_scan = fetched_pack.scan.is_some();
+    let (ingest_report, ingest_ms) = measure_ms(|| {
+        if let Some(scan) = fetched_pack.scan.as_ref() {
+            let pack = read_pack_arc(&repo.pack_temp_path())?;
+            ingest_scanned_pack(
+                &repo.pack_temp_path(),
+                &repo.pack_index_temp_path(),
+                pack,
+                scan,
+                fetched_pack.scan_ms,
+            )
+        } else {
+            ingest_fetched_pack(
+                &repo.pack_temp_path(),
+                &repo.pack_index_temp_path(),
+                fetched_pack.checksum,
+            )
+        }
+    });
     let ingest_report = ingest_report?;
     let pack_scan_ms = ingest_report.scan_ms;
     let pack_resolve_ms = ingest_report.resolve_ms;
@@ -65,19 +81,17 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let spilled_object_count = pack_index.spilled_object_count();
     let spilled_object_bytes = pack_index.spilled_object_bytes();
     repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
-    enforce_max_bytes(
-        "FCL_MAX_TEMP_BYTES",
-        directory_bytes(repo.root())?,
-        "checking target size after ingest",
-    )?;
+    enforce_target_size_limit(max_temp_bytes, &repo, "checking target size after ingest")?;
     let (checkout, checkout_ms) =
         measure_ms(|| materialize_default_branch(&repo, &pack_index, default_commit));
     let checkout = checkout?;
     let reconstructed_object_count = pack_index.reconstructed_object_count();
+    let total_ms = start.elapsed().as_millis();
     let target_bytes = directory_bytes(repo.root())?;
     let rss_bytes = rss_bytes();
-    enforce_max_bytes(
+    enforce_optional_max_bytes(
         "FCL_MAX_TEMP_BYTES",
+        max_temp_bytes,
         target_bytes,
         "checking final target size",
     )?;
@@ -85,7 +99,7 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     Ok(CloneReport {
         ref_count,
         pack_bytes,
-        total_ms: start.elapsed().as_millis(),
+        total_ms,
         discovery_ms,
         fetch_ms,
         ingest_ms,
@@ -93,6 +107,7 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         pack_resolve_ms,
         pack_idx_write_ms,
         pack_object_state_ms,
+        streaming_pack_scan,
         checkout_ms,
         checkout_manifest_ms: checkout.manifest_ms,
         checkout_dir_create_ms: checkout.dir_create_ms,
@@ -111,12 +126,29 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     })
 }
 
-fn enforce_max_bytes(
+fn enforce_target_size_limit(
+    max: Option<u64>,
+    repo: &RepoLayout,
+    operation: &'static str,
+) -> Result<(), CloneError> {
+    if max.is_none() {
+        return Ok(());
+    }
+    enforce_optional_max_bytes(
+        "FCL_MAX_TEMP_BYTES",
+        max,
+        directory_bytes(repo.root())?,
+        operation,
+    )
+}
+
+fn enforce_optional_max_bytes(
     env_name: &'static str,
+    max: Option<u64>,
     actual: u64,
     operation: &'static str,
 ) -> Result<(), CloneError> {
-    let Some(max) = optional_u64_env(env_name)? else {
+    let Some(max) = max else {
         return Ok(());
     };
     if actual > max {
