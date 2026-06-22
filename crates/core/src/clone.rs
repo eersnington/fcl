@@ -7,7 +7,10 @@ use url::Url;
 use crate::checkout::materialize_default_branch;
 use crate::error::CloneError;
 use crate::metrics::{CloneReport, measure_ms};
-use crate::pack::{ObjectId, PackStorage, ingest_fetched_pack, ingest_scanned_pack};
+use crate::pack::{
+    CheckoutHint, ObjectId, PackIngestOptions, PackStorage, ingest_fetched_pack,
+    ingest_scanned_pack,
+};
 use crate::protocol::{discover_remote, fetch_full_pack, http_client};
 use crate::repo::RepoLayout;
 
@@ -23,6 +26,10 @@ impl CloneRequest {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level clone orchestration keeps phase timing and report assembly together"
+)]
 pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let start = Instant::now();
     let client = http_client()?;
@@ -52,6 +59,9 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     )?;
     enforce_target_size_limit(max_temp_bytes, &repo, "checking target size after fetch")?;
     let streaming_pack_scan = fetched_pack.scan.is_some();
+    let ingest_options = PackIngestOptions {
+        checkout_hint: Some(CheckoutHint { default_commit }),
+    };
     let (ingest_report, ingest_ms) = measure_ms(|| {
         if let Some(scan) = fetched_pack.scan.as_ref() {
             let pack = PackStorage::open_file_backed(&repo.pack_temp_path())?;
@@ -61,12 +71,14 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
                 pack,
                 scan,
                 fetched_pack.scan_ms,
+                ingest_options,
             )
         } else {
             ingest_fetched_pack(
                 &repo.pack_temp_path(),
                 &repo.pack_index_temp_path(),
                 fetched_pack.checksum,
+                ingest_options,
             )
         }
     });
@@ -80,6 +92,12 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let retained_object_bytes = pack_index.retained_object_bytes();
     let spilled_object_count = pack_index.spilled_object_count();
     let spilled_object_bytes = pack_index.spilled_object_bytes();
+    let checkout_needed_blob_count = ingest_report.checkout_needed_blob_count;
+    let checkout_ready_blob_count = ingest_report.checkout_ready_blob_count;
+    let checkout_ready_blob_bytes = ingest_report.checkout_ready_blob_bytes;
+    let checkout_spilled_blob_count = ingest_report.checkout_spilled_blob_count;
+    let checkout_spilled_blob_bytes = ingest_report.checkout_spilled_blob_bytes;
+    let checkout_missing_blob_count = ingest_report.checkout_missing_blob_count;
     repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
     enforce_target_size_limit(max_temp_bytes, &repo, "checking target size after ingest")?;
     let (checkout, checkout_ms) =
@@ -120,6 +138,12 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         retained_object_bytes,
         spilled_object_count,
         spilled_object_bytes,
+        checkout_needed_blob_count,
+        checkout_ready_blob_count,
+        checkout_ready_blob_bytes,
+        checkout_spilled_blob_count,
+        checkout_spilled_blob_bytes,
+        checkout_missing_blob_count,
         reconstructed_object_count,
         target_bytes,
         rss_bytes,

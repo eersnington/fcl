@@ -93,6 +93,15 @@ fn main() {
                 report.spilled_object_bytes,
                 report.reconstructed_object_count
             );
+            eprintln!(
+                "fcl: checkout blobs needed={} ready={} ready_bytes={} spilled={} spilled_bytes={} missing={}",
+                report.checkout_needed_blob_count,
+                report.checkout_ready_blob_count,
+                report.checkout_ready_blob_bytes,
+                report.checkout_spilled_blob_count,
+                report.checkout_spilled_blob_bytes,
+                report.checkout_missing_blob_count
+            );
             eprintln!("fcl: target uses {} bytes", report.target_bytes);
             if let Some(rss_bytes) = report.rss_bytes {
                 eprintln!("fcl: rss {rss_bytes} bytes");

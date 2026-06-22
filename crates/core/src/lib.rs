@@ -3,6 +3,7 @@
 mod checkout;
 mod clone;
 mod error;
+mod git_object;
 mod local;
 mod metrics;
 mod pack;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 
 use crate::error::CloneError;
+use crate::git_object::{self, TreeEntryMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectType {
@@ -137,6 +138,22 @@ pub struct PackIngestReport {
     pub resolve_ms: u128,
     pub idx_write_ms: u128,
     pub object_state_ms: u128,
+    pub checkout_needed_blob_count: usize,
+    pub checkout_ready_blob_count: usize,
+    pub checkout_ready_blob_bytes: usize,
+    pub checkout_spilled_blob_count: usize,
+    pub checkout_spilled_blob_bytes: usize,
+    pub checkout_missing_blob_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PackIngestOptions {
+    pub checkout_hint: Option<CheckoutHint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CheckoutHint {
+    pub default_commit: ObjectId,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +170,12 @@ struct ObjectStateBuild {
     retained_object_bytes: usize,
     spilled_object_count: usize,
     spilled_object_bytes: usize,
+    checkout_needed_blob_count: usize,
+    checkout_ready_blob_count: usize,
+    checkout_ready_blob_bytes: usize,
+    checkout_spilled_blob_count: usize,
+    checkout_spilled_blob_bytes: usize,
+    checkout_missing_blob_count: usize,
 }
 
 impl PackIndex {
@@ -496,6 +519,7 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIngestRepo
         PackStorage::from_memory(pack),
         &scan,
         scan_ms,
+        PackIngestOptions::default(),
     )
 }
 
@@ -503,6 +527,7 @@ pub fn ingest_fetched_pack(
     pack_path: &Path,
     index_path: &Path,
     checksum: [u8; 20],
+    options: PackIngestOptions,
 ) -> Result<PackIngestReport, CloneError> {
     let pack = read_pack_arc(pack_path)?;
 
@@ -517,7 +542,7 @@ pub fn ingest_fetched_pack(
     drop(pack);
 
     let pack = PackStorage::open_file_backed(pack_path)?;
-    ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms)
+    ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms, options)
 }
 
 pub fn read_pack_arc(pack_path: &Path) -> Result<Arc<[u8]>, CloneError> {
@@ -535,9 +560,15 @@ pub fn ingest_scanned_pack(
     pack: PackStorage,
     scan: &PackScan,
     scan_ms: u128,
+    options: PackIngestOptions,
 ) -> Result<PackIngestReport, CloneError> {
     let resolve_start = Instant::now();
-    let resolved = resolve_inflated_frames(pack_path, &pack, &scan.frames)?;
+    let resolved = resolve_inflated_frames(
+        pack_path,
+        &pack,
+        &scan.frames,
+        options.checkout_hint.is_some(),
+    )?;
     let resolve_ms = resolve_start.elapsed().as_millis();
 
     let mut entries = resolved
@@ -585,7 +616,8 @@ pub fn ingest_scanned_pack(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("fcl-spill");
-    let cache = build_object_states(pack_path, &spill_dir, resolved)?;
+    let checkout_needed_blobs = checkout_needed_blobs(options.checkout_hint, &resolved)?;
+    let cache = build_object_states(pack_path, &spill_dir, resolved, &checkout_needed_blobs)?;
     let object_state_ms = object_state_start.elapsed().as_millis();
 
     Ok(PackIngestReport {
@@ -605,6 +637,12 @@ pub fn ingest_scanned_pack(
         resolve_ms,
         idx_write_ms,
         object_state_ms,
+        checkout_needed_blob_count: cache.checkout_needed_blob_count,
+        checkout_ready_blob_count: cache.checkout_ready_blob_count,
+        checkout_ready_blob_bytes: cache.checkout_ready_blob_bytes,
+        checkout_spilled_blob_count: cache.checkout_spilled_blob_count,
+        checkout_spilled_blob_bytes: cache.checkout_spilled_blob_bytes,
+        checkout_missing_blob_count: cache.checkout_missing_blob_count,
     })
 }
 
@@ -612,8 +650,11 @@ fn build_object_states(
     pack_path: &Path,
     spill_dir: &Path,
     resolved: Vec<ResolvedFrame>,
+    checkout_needed_blobs: &HashSet<ObjectId>,
 ) -> Result<ObjectStateBuild, CloneError> {
     let resident_limit = optional_usize_env("FCL_OBJECT_CACHE_BYTES")?.unwrap_or(512 * 1024 * 1024);
+    let checkout_resident_limit =
+        optional_usize_env("FCL_CHECKOUT_BLOB_CACHE_BYTES")?.unwrap_or(256 * 1024 * 1024);
     let max_spill_bytes = optional_usize_env("FCL_MAX_SPILL_BYTES")?;
     let spill_blobs = env_bool("FCL_SPILL_BLOBS");
     let configured_spill_dir = std::env::var_os("FCL_SPILL_DIR").map(PathBuf::from);
@@ -624,14 +665,47 @@ fn build_object_states(
     let mut retained_object_bytes = 0usize;
     let mut spilled_object_count = 0usize;
     let mut spilled_object_bytes = 0usize;
+    let mut checkout_resident_bytes = 0usize;
+    let mut checkout_ready_blob_count = 0usize;
+    let mut checkout_ready_blob_bytes = 0usize;
+    let mut checkout_spilled_blob_count = 0usize;
+    let mut checkout_spilled_blob_bytes = 0usize;
+    let mut checkout_missing_blob_count = 0usize;
 
     for frame in resolved {
         let oid = ObjectId::from_bytes(frame.object.oid);
         let data_len = frame.object.data.len();
+        let is_checkout_needed_blob =
+            frame.object.object_type == ObjectType::Blob && checkout_needed_blobs.contains(&oid);
         let should_keep_resident = frame.object.object_type != ObjectType::Blob
             && retained_object_bytes.saturating_add(data_len) <= resident_limit;
 
-        let state = if should_keep_resident {
+        let state = if is_checkout_needed_blob && data_len == 0 && frame.object.size != 0 {
+            checkout_missing_blob_count += 1;
+            ObjectDataState::Reconstructable
+        } else if is_checkout_needed_blob
+            && checkout_resident_bytes.saturating_add(data_len) <= checkout_resident_limit
+        {
+            retained_object_count += 1;
+            retained_object_bytes += data_len;
+            checkout_resident_bytes += data_len;
+            checkout_ready_blob_count += 1;
+            checkout_ready_blob_bytes += data_len;
+            ObjectDataState::Resident(frame.object.data)
+        } else if is_checkout_needed_blob {
+            let path = spill_object(pack_path, spill_dir, oid, &frame.object.data)?;
+            spilled_object_count += 1;
+            spilled_object_bytes = spilled_object_bytes.saturating_add(data_len);
+            checkout_spilled_blob_count += 1;
+            checkout_spilled_blob_bytes = checkout_spilled_blob_bytes.saturating_add(data_len);
+            checkout_ready_blob_count += 1;
+            checkout_ready_blob_bytes += data_len;
+            enforce_max_spill_bytes(max_spill_bytes, spilled_object_bytes)?;
+            ObjectDataState::Spilled {
+                path,
+                len: data_len as u64,
+            }
+        } else if should_keep_resident {
             retained_object_count += 1;
             retained_object_bytes += data_len;
             ObjectDataState::Resident(frame.object.data)
@@ -639,16 +713,7 @@ fn build_object_states(
             let path = spill_object(pack_path, spill_dir, oid, &frame.object.data)?;
             spilled_object_count += 1;
             spilled_object_bytes = spilled_object_bytes.saturating_add(data_len);
-            if let Some(max_spill_bytes) = max_spill_bytes
-                && spilled_object_bytes > max_spill_bytes
-            {
-                return Err(CloneError::CloneLimitExceeded {
-                    operation: "spilling object data",
-                    detail: format!(
-                        "FCL_MAX_SPILL_BYTES is {max_spill_bytes}, but spilled object data reached {spilled_object_bytes} bytes"
-                    ),
-                });
-            }
+            enforce_max_spill_bytes(max_spill_bytes, spilled_object_bytes)?;
             ObjectDataState::Spilled {
                 path,
                 len: data_len as u64,
@@ -665,7 +730,91 @@ fn build_object_states(
         retained_object_bytes,
         spilled_object_count,
         spilled_object_bytes,
+        checkout_needed_blob_count: checkout_needed_blobs.len(),
+        checkout_ready_blob_count,
+        checkout_ready_blob_bytes,
+        checkout_spilled_blob_count,
+        checkout_spilled_blob_bytes,
+        checkout_missing_blob_count,
     })
+}
+
+fn enforce_max_spill_bytes(
+    max: Option<usize>,
+    spilled_object_bytes: usize,
+) -> Result<(), CloneError> {
+    if let Some(max_spill_bytes) = max
+        && spilled_object_bytes > max_spill_bytes
+    {
+        return Err(CloneError::CloneLimitExceeded {
+            operation: "spilling object data",
+            detail: format!(
+                "FCL_MAX_SPILL_BYTES is {max_spill_bytes}, but spilled object data reached {spilled_object_bytes} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn checkout_needed_blobs(
+    checkout_hint: Option<CheckoutHint>,
+    resolved: &[ResolvedFrame],
+) -> Result<HashSet<ObjectId>, CloneError> {
+    let Some(checkout_hint) = checkout_hint else {
+        return Ok(HashSet::new());
+    };
+    let objects_by_oid = resolved
+        .iter()
+        .map(|frame| (ObjectId::from_bytes(frame.object.oid), frame))
+        .collect::<HashMap<_, _>>();
+    let commit = objects_by_oid
+        .get(&checkout_hint.default_commit)
+        .ok_or_else(|| CloneError::ObjectLookupFailed {
+            oid: checkout_hint.default_commit.to_hex(),
+            expected_type: "commit",
+            detail: "default branch commit was not present in the fetched pack".to_owned(),
+        })?;
+    if commit.object.object_type != ObjectType::Commit {
+        return Err(CloneError::ObjectLookupFailed {
+            oid: checkout_hint.default_commit.to_hex(),
+            expected_type: "commit",
+            detail: format!("found {}", commit.object.object_type.as_git_name()),
+        });
+    }
+    let root_tree_oid =
+        git_object::parse_commit_tree_oid(checkout_hint.default_commit, &commit.object.data)?;
+    let mut needed_blobs = HashSet::new();
+    let mut queued_trees = vec![root_tree_oid];
+    let mut seen_trees = HashSet::new();
+    while let Some(tree_oid) = queued_trees.pop() {
+        if !seen_trees.insert(tree_oid) {
+            continue;
+        }
+        let tree = objects_by_oid
+            .get(&tree_oid)
+            .ok_or_else(|| CloneError::ObjectLookupFailed {
+                oid: tree_oid.to_hex(),
+                expected_type: "tree",
+                detail: "default branch tree was not present in the fetched pack".to_owned(),
+            })?;
+        if tree.object.object_type != ObjectType::Tree {
+            return Err(CloneError::ObjectLookupFailed {
+                oid: tree_oid.to_hex(),
+                expected_type: "tree",
+                detail: format!("found {}", tree.object.object_type.as_git_name()),
+            });
+        }
+        for entry in git_object::parse_tree_entries(tree_oid, &tree.object.data)? {
+            match entry.mode {
+                TreeEntryMode::Directory => queued_trees.push(entry.oid),
+                TreeEntryMode::File | TreeEntryMode::Executable | TreeEntryMode::Symlink => {
+                    needed_blobs.insert(entry.oid);
+                }
+                TreeEntryMode::Gitlink => {}
+            }
+        }
+    }
+    Ok(needed_blobs)
 }
 
 fn spill_object(
@@ -1409,6 +1558,7 @@ fn resolve_inflated_frames(
     pack_path: &Path,
     pack: &PackStorage,
     frames: &[ObjectFrame],
+    keep_blob_data: bool,
 ) -> Result<Vec<ResolvedFrame>, CloneError> {
     let adjacency = build_delta_adjacency(frames);
     let offset_to_frame_index = frames
@@ -1508,7 +1658,13 @@ fn resolve_inflated_frames(
             .collect::<Vec<_>>();
 
         for (frame, base_frame_index) in collect_results(round_results)? {
-            release_delta_base_if_done(&mut resolved, &mut unresolved_children, base_frame_index);
+            if !keep_blob_data {
+                release_delta_base_if_done(
+                    &mut resolved,
+                    &mut unresolved_children,
+                    base_frame_index,
+                );
+            }
             let index = resolved.len();
             resolved_by_offset.insert(frame.offset, index);
             resolved_by_oid.insert(frame.object.oid, index);
@@ -2137,10 +2293,13 @@ fn validate_unique_objects(index_path: &Path, entries: &[IndexEntry]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        EncodedObjectKind, ObjectDataState, PackIndex, PackStorage, ScanPayload, ingest_pack,
-        ingest_scanned_pack, scan_pack, validate_pack,
+        CheckoutHint, EncodedObjectKind, ObjectDataState, PackIndex, PackIngestOptions,
+        PackStorage, ScanPayload, ingest_pack, ingest_scanned_pack, scan_pack, validate_pack,
     };
+    use crate::checkout::materialize_default_branch;
     use crate::pack::{ObjectId, ObjectReader};
+    use crate::repo::RepoLayout;
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -2183,6 +2342,7 @@ mod tests {
             PackStorage::from_memory(pack),
             &scan,
             0,
+            PackIngestOptions::default(),
         )
         .expect("scanned ingest should work");
 
@@ -2268,6 +2428,7 @@ mod tests {
             PackStorage::from_memory(Arc::clone(&pack)),
             &scan,
             0,
+            PackIngestOptions::default(),
         )
         .expect("memory ingest should work");
         let file_backed = ingest_scanned_pack(
@@ -2276,6 +2437,7 @@ mod tests {
             PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
             &scan,
             0,
+            PackIngestOptions::default(),
         )
         .expect("file-backed ingest should work");
 
@@ -2305,6 +2467,7 @@ mod tests {
             PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
             &scan,
             0,
+            PackIngestOptions::default(),
         )
         .expect("file-backed ingest should work");
         report
@@ -2319,6 +2482,71 @@ mod tests {
             .expect("blob should reconstruct from file-backed pack");
 
         assert_eq!(actual, expected);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn ingest_with_checkout_hint_should_retain_default_branch_blobs() {
+        let temp = test_temp_dir("checkout-hint-retain");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let scan = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+        let default_commit = ObjectId::parse_hex(&run_git_stdout(&repo, &["rev-parse", "HEAD"]))
+            .expect("default commit oid should parse");
+        let expected_blobs = checkout_blob_oids(&repo);
+        let report = ingest_scanned_pack(
+            &pack_path,
+            &temp.join("checkout-hint.idx"),
+            PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
+            &scan,
+            0,
+            PackIngestOptions {
+                checkout_hint: Some(CheckoutHint { default_commit }),
+            },
+        )
+        .expect("checkout-hinted ingest should work");
+        let checkout = temp.join("checkout");
+        let layout = RepoLayout::create(&checkout).expect("checkout repo layout should be created");
+
+        materialize_default_branch(&layout, &report.index, default_commit)
+            .expect("checkout should materialize from retained blobs");
+
+        assert_eq!(report.checkout_needed_blob_count, expected_blobs.len());
+        assert_eq!(report.checkout_ready_blob_count, expected_blobs.len());
+        assert_eq!(report.checkout_missing_blob_count, 0);
+        assert_eq!(report.index.reconstructed_object_count(), 0);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn ingest_without_checkout_hint_should_preserve_reconstructable_blob_behavior() {
+        let temp = test_temp_dir("checkout-hint-disabled");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let scan = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+        let default_commit = ObjectId::parse_hex(&run_git_stdout(&repo, &["rev-parse", "HEAD"]))
+            .expect("default commit oid should parse");
+        let report = ingest_scanned_pack(
+            &pack_path,
+            &temp.join("without-checkout-hint.idx"),
+            PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
+            &scan,
+            0,
+            PackIngestOptions::default(),
+        )
+        .expect("default ingest should work");
+        let checkout = temp.join("checkout");
+        let layout = RepoLayout::create(&checkout).expect("checkout repo layout should be created");
+
+        materialize_default_branch(&layout, &report.index, default_commit)
+            .expect("checkout should materialize from reconstructable blobs");
+
+        assert_eq!(report.checkout_needed_blob_count, 0);
+        assert!(report.index.reconstructed_object_count() > 0);
         fs::remove_dir_all(temp).expect("test temp directory should be removed");
     }
 
@@ -2363,6 +2591,14 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn checkout_blob_oids(repo: &Path) -> HashSet<ObjectId> {
+        run_git_stdout(repo, &["ls-tree", "-r", "HEAD"])
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .map(|oid| ObjectId::parse_hex(oid).expect("blob oid should parse"))
+            .collect()
     }
 
     fn build_packed_test_repo(temp: &Path) -> PathBuf {

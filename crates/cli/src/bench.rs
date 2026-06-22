@@ -81,6 +81,12 @@ struct BenchResult {
     retained_object_bytes: Option<usize>,
     spilled_object_count: Option<usize>,
     spilled_object_bytes: Option<usize>,
+    checkout_needed_blob_count: Option<usize>,
+    checkout_ready_blob_count: Option<usize>,
+    checkout_ready_blob_bytes: Option<usize>,
+    checkout_spilled_blob_count: Option<usize>,
+    checkout_spilled_blob_bytes: Option<usize>,
+    checkout_missing_blob_count: Option<usize>,
     reconstructed_object_count: Option<usize>,
     target_bytes: Option<u64>,
     rss_bytes: Option<u64>,
@@ -98,7 +104,7 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
 
     if cli.output.csv {
         println!(
-            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,reconstructed_object_count,target_bytes,rss_bytes,git_trace_path,validated"
+            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,checkout_needed_blob_count,checkout_ready_blob_count,checkout_ready_blob_bytes,checkout_spilled_blob_count,checkout_spilled_blob_bytes,checkout_missing_blob_count,reconstructed_object_count,target_bytes,rss_bytes,git_trace_path,validated"
         );
     }
 
@@ -193,6 +199,12 @@ fn run_git_bench(
         retained_object_bytes: None,
         spilled_object_count: None,
         spilled_object_bytes: None,
+        checkout_needed_blob_count: None,
+        checkout_ready_blob_count: None,
+        checkout_ready_blob_bytes: None,
+        checkout_spilled_blob_count: None,
+        checkout_spilled_blob_bytes: None,
+        checkout_missing_blob_count: None,
         reconstructed_object_count: None,
         target_bytes: target_size(&target).ok(),
         rss_bytes: None,
@@ -232,6 +244,12 @@ impl BenchResult {
             retained_object_bytes: Some(report.retained_object_bytes),
             spilled_object_count: Some(report.spilled_object_count),
             spilled_object_bytes: Some(report.spilled_object_bytes),
+            checkout_needed_blob_count: Some(report.checkout_needed_blob_count),
+            checkout_ready_blob_count: Some(report.checkout_ready_blob_count),
+            checkout_ready_blob_bytes: Some(report.checkout_ready_blob_bytes),
+            checkout_spilled_blob_count: Some(report.checkout_spilled_blob_count),
+            checkout_spilled_blob_bytes: Some(report.checkout_spilled_blob_bytes),
+            checkout_missing_blob_count: Some(report.checkout_missing_blob_count),
             reconstructed_object_count: Some(report.reconstructed_object_count),
             target_bytes: Some(report.target_bytes),
             rss_bytes: report.rss_bytes,
@@ -365,7 +383,7 @@ fn print_result(cli: &BenchCli, result: &BenchResult) {
 
 fn print_json_result(url: &str, result: &BenchResult) {
     println!(
-        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"validated\":{}}}",
+        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"checkout_needed_blob_count\":{},\"checkout_ready_blob_count\":{},\"checkout_ready_blob_bytes\":{},\"checkout_spilled_blob_count\":{},\"checkout_spilled_blob_bytes\":{},\"checkout_missing_blob_count\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"validated\":{}}}",
         escape_json(url),
         result.tool,
         result.run,
@@ -392,6 +410,12 @@ fn print_json_result(url: &str, result: &BenchResult) {
         option_usize(result.retained_object_bytes),
         option_usize(result.spilled_object_count),
         option_usize(result.spilled_object_bytes),
+        option_usize(result.checkout_needed_blob_count),
+        option_usize(result.checkout_ready_blob_count),
+        option_usize(result.checkout_ready_blob_bytes),
+        option_usize(result.checkout_spilled_blob_count),
+        option_usize(result.checkout_spilled_blob_bytes),
+        option_usize(result.checkout_missing_blob_count),
         option_usize(result.reconstructed_object_count),
         option_u64(result.target_bytes),
         option_u64(result.rss_bytes),
@@ -402,7 +426,7 @@ fn print_json_result(url: &str, result: &BenchResult) {
 
 fn print_csv_result(url: &str, result: &BenchResult) {
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         url,
         result.tool,
         result.run,
@@ -429,6 +453,12 @@ fn print_csv_result(url: &str, result: &BenchResult) {
         csv_usize(result.retained_object_bytes),
         csv_usize(result.spilled_object_count),
         csv_usize(result.spilled_object_bytes),
+        csv_usize(result.checkout_needed_blob_count),
+        csv_usize(result.checkout_ready_blob_count),
+        csv_usize(result.checkout_ready_blob_bytes),
+        csv_usize(result.checkout_spilled_blob_count),
+        csv_usize(result.checkout_spilled_blob_bytes),
+        csv_usize(result.checkout_missing_blob_count),
         csv_usize(result.reconstructed_object_count),
         csv_u64(result.target_bytes),
         csv_u64(result.rss_bytes),
@@ -439,7 +469,7 @@ fn print_csv_result(url: &str, result: &BenchResult) {
 
 fn print_plain_result(result: &BenchResult) {
     println!(
-        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} reconstructed_objects={} target_bytes={} rss={} git_trace={} validated={}",
+        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} checkout_needed_blobs={} checkout_ready_blobs={} checkout_ready_blob_bytes={} checkout_spilled_blobs={} checkout_spilled_blob_bytes={} checkout_missing_blobs={} reconstructed_objects={} target_bytes={} rss={} git_trace={} validated={}",
         result.tool,
         result.run,
         result.total_ms,
@@ -465,6 +495,12 @@ fn print_plain_result(result: &BenchResult) {
         usize_or_dash(result.retained_object_bytes),
         usize_or_dash(result.spilled_object_count),
         usize_or_dash(result.spilled_object_bytes),
+        usize_or_dash(result.checkout_needed_blob_count),
+        usize_or_dash(result.checkout_ready_blob_count),
+        usize_or_dash(result.checkout_ready_blob_bytes),
+        usize_or_dash(result.checkout_spilled_blob_count),
+        usize_or_dash(result.checkout_spilled_blob_bytes),
+        usize_or_dash(result.checkout_missing_blob_count),
         usize_or_dash(result.reconstructed_object_count),
         u64_or_dash(result.target_bytes),
         u64_or_dash(result.rss_bytes),

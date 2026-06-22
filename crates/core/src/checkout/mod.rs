@@ -9,42 +9,15 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 use sha1::{Digest, Sha1};
 
 use crate::error::CloneError;
+use crate::git_object::{self, TreeEntryMode};
 use crate::pack::{ObjectId, ObjectReader, ObjectType};
 use crate::repo::RepoLayout;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeMode {
-    File,
-    Executable,
-    Symlink,
-    Directory,
-    Gitlink,
-}
-
-impl TreeMode {
-    const fn index_mode(self) -> u32 {
-        match self {
-            Self::File => 0o100_644,
-            Self::Executable => 0o100_755,
-            Self::Symlink => 0o120_000,
-            Self::Directory => 0o040_000,
-            Self::Gitlink => 0o160_000,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TreeEntry {
-    mode: TreeMode,
-    name: String,
-    oid: ObjectId,
-}
 
 #[derive(Debug, Clone)]
 struct CheckoutEntry {
     path: PathBuf,
     git_path: Vec<u8>,
-    mode: TreeMode,
+    mode: TreeEntryMode,
     oid: ObjectId,
     size: u32,
     stat: FileStat,
@@ -61,7 +34,7 @@ struct CheckoutDirectory {
 struct CheckoutManifestEntry {
     path: PathBuf,
     git_path: Vec<u8>,
-    mode: TreeMode,
+    mode: TreeEntryMode,
     oid: ObjectId,
     size: u64,
 }
@@ -95,7 +68,7 @@ pub fn materialize_default_branch(
     commit_oid: ObjectId,
 ) -> Result<CheckoutReport, CloneError> {
     let manifest_start = Instant::now();
-    let root_tree_oid = parse_commit_tree_oid(object_reader, commit_oid)?;
+    let root_tree_oid = read_commit_tree_oid(object_reader, commit_oid)?;
     let mut directories = Vec::new();
     let mut manifest = Vec::new();
     collect_tree_manifest(
@@ -132,7 +105,7 @@ pub fn materialize_default_branch(
     })
 }
 
-fn parse_commit_tree_oid(
+fn read_commit_tree_oid(
     object_reader: &dyn ObjectReader,
     commit_oid: ObjectId,
 ) -> Result<ObjectId, CloneError> {
@@ -144,23 +117,7 @@ fn parse_commit_tree_oid(
             detail: format!("found {}", object.object_type.as_git_name()),
         });
     }
-    let text =
-        std::str::from_utf8(&object.data).map_err(|error| CloneError::ObjectParseFailed {
-            oid: commit_oid.to_hex(),
-            object_type: "commit",
-            operation: "reading commit as UTF-8",
-            detail: error.to_string(),
-        })?;
-    let tree = text
-        .lines()
-        .find_map(|line| line.strip_prefix("tree "))
-        .ok_or_else(|| CloneError::ObjectParseFailed {
-            oid: commit_oid.to_hex(),
-            object_type: "commit",
-            operation: "finding tree header",
-            detail: "commit did not contain a tree header".to_owned(),
-        })?;
-    ObjectId::parse_hex(tree)
+    git_object::parse_commit_tree_oid(commit_oid, &object.data)
 }
 
 fn collect_tree_manifest(
@@ -179,11 +136,11 @@ fn collect_tree_manifest(
         });
     }
 
-    for entry in parse_tree(tree_oid, &object.data)? {
+    for entry in git_object::parse_tree_entries(tree_oid, &object.data)? {
         let relative_path = relative_dir.join(&entry.name);
         validate_relative_path(&relative_path)?;
         match entry.mode {
-            TreeMode::Directory => {
+            TreeEntryMode::Directory => {
                 directories.push(CheckoutDirectory {
                     git_path: git_index_path_bytes(&relative_path),
                     depth: path_depth(&relative_path),
@@ -197,8 +154,8 @@ fn collect_tree_manifest(
                     manifest,
                 )?;
             }
-            TreeMode::Gitlink => {}
-            TreeMode::File | TreeMode::Executable | TreeMode::Symlink => {
+            TreeEntryMode::Gitlink => {}
+            TreeEntryMode::File | TreeEntryMode::Executable | TreeEntryMode::Symlink => {
                 let object = object_reader.get_meta(entry.oid).ok_or_else(|| {
                     CloneError::ObjectLookupFailed {
                         oid: entry.oid.to_hex(),
@@ -328,10 +285,10 @@ fn materialize_manifest_entry(
     let path = root.join(&entry.path);
 
     let metadata = match entry.mode {
-        TreeMode::File | TreeMode::Executable => {
+        TreeEntryMode::File | TreeEntryMode::Executable => {
             materialize_regular_file(&path, entry, object_reader)?
         }
-        TreeMode::Symlink => {
+        TreeEntryMode::Symlink => {
             let target = object_reader.read_object(entry.oid)?;
             if target.object_type != ObjectType::Blob {
                 return Err(CloneError::ObjectLookupFailed {
@@ -347,7 +304,7 @@ fn materialize_manifest_entry(
                 detail: error.to_string(),
             })?
         }
-        TreeMode::Directory | TreeMode::Gitlink => {
+        TreeEntryMode::Directory | TreeEntryMode::Gitlink => {
             return Err(CloneError::CheckoutFailed {
                 path: entry.path.clone(),
                 operation: "materializing checkout entry",
@@ -378,7 +335,7 @@ fn materialize_regular_file(
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(match entry.mode {
-        TreeMode::Executable => 0o755,
+        TreeEntryMode::Executable => 0o755,
         _ => 0o644,
     });
     let mut file = options
@@ -397,7 +354,7 @@ fn materialize_regular_file(
         });
     }
     #[cfg(unix)]
-    if entry.mode == TreeMode::Executable {
+    if entry.mode == TreeEntryMode::Executable {
         let metadata = file
             .metadata()
             .map_err(|error| CloneError::CheckoutFailed {
@@ -443,84 +400,6 @@ fn create_symlink(path: &Path, _target: &[u8]) -> Result<(), CloneError> {
         path: path.to_owned(),
         operation: "creating symlink",
         detail: "symlink checkout is not supported on this platform yet".to_owned(),
-    })
-}
-
-fn parse_tree(tree_oid: ObjectId, data: &[u8]) -> Result<Vec<TreeEntry>, CloneError> {
-    let mut entries = Vec::new();
-    let mut cursor = 0usize;
-    while cursor < data.len() {
-        let mode_start = cursor;
-        while cursor < data.len() && data[cursor] != b' ' {
-            cursor += 1;
-        }
-        if cursor == data.len() {
-            return tree_parse_error(tree_oid, "tree entry mode was not terminated by a space");
-        }
-        let mode = std::str::from_utf8(&data[mode_start..cursor]).map_err(|error| {
-            CloneError::ObjectParseFailed {
-                oid: tree_oid.to_hex(),
-                object_type: "tree",
-                operation: "parsing entry mode",
-                detail: error.to_string(),
-            }
-        })?;
-        cursor += 1;
-
-        let name_start = cursor;
-        while cursor < data.len() && data[cursor] != 0 {
-            cursor += 1;
-        }
-        if cursor == data.len() {
-            return tree_parse_error(tree_oid, "tree entry name was not NUL terminated");
-        }
-        let name = std::str::from_utf8(&data[name_start..cursor]).map_err(|error| {
-            CloneError::ObjectParseFailed {
-                oid: tree_oid.to_hex(),
-                object_type: "tree",
-                operation: "parsing entry name",
-                detail: error.to_string(),
-            }
-        })?;
-        cursor += 1;
-        if data.len() - cursor < 20 {
-            return tree_parse_error(tree_oid, "tree entry object id was truncated");
-        }
-        let mut oid = [0u8; 20];
-        oid.copy_from_slice(&data[cursor..cursor + 20]);
-        cursor += 20;
-
-        entries.push(TreeEntry {
-            mode: parse_tree_mode(tree_oid, mode)?,
-            name: name.to_owned(),
-            oid: ObjectId::from_bytes(oid),
-        });
-    }
-    Ok(entries)
-}
-
-fn parse_tree_mode(tree_oid: ObjectId, mode: &str) -> Result<TreeMode, CloneError> {
-    match mode {
-        "100644" => Ok(TreeMode::File),
-        "100755" => Ok(TreeMode::Executable),
-        "120000" => Ok(TreeMode::Symlink),
-        "040000" | "40000" => Ok(TreeMode::Directory),
-        "160000" => Ok(TreeMode::Gitlink),
-        other => Err(CloneError::ObjectParseFailed {
-            oid: tree_oid.to_hex(),
-            object_type: "tree",
-            operation: "parsing entry mode",
-            detail: format!("unsupported tree mode `{other}`"),
-        }),
-    }
-}
-
-fn tree_parse_error<T>(tree_oid: ObjectId, detail: &str) -> Result<T, CloneError> {
-    Err(CloneError::ObjectParseFailed {
-        oid: tree_oid.to_hex(),
-        object_type: "tree",
-        operation: "parsing tree entry",
-        detail: detail.to_owned(),
     })
 }
 
