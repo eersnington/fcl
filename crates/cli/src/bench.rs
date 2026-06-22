@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -88,9 +89,18 @@ struct BenchResult {
     checkout_spilled_blob_bytes: Option<usize>,
     checkout_missing_blob_count: Option<usize>,
     reconstructed_object_count: Option<usize>,
+    pipeline_enabled: bool,
+    pipeline_frame_count: Option<usize>,
+    pipeline_checkout_wait_ms: Option<u128>,
+    pipeline_peak_pending_delta_count: Option<usize>,
+    pipeline_arena_spill_bytes: Option<u64>,
     target_bytes: Option<u64>,
     rss_bytes: Option<u64>,
     git_trace_path: Option<PathBuf>,
+    git_remote_ms: Option<u128>,
+    git_index_pack_ms: Option<u128>,
+    git_checkout_ms: Option<u128>,
+    git_trace_parse_error: Option<String>,
     validated: bool,
 }
 
@@ -104,7 +114,7 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
 
     if cli.output.csv {
         println!(
-            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,checkout_needed_blob_count,checkout_ready_blob_count,checkout_ready_blob_bytes,checkout_spilled_blob_count,checkout_spilled_blob_bytes,checkout_missing_blob_count,reconstructed_object_count,target_bytes,rss_bytes,git_trace_path,validated"
+            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,checkout_needed_blob_count,checkout_ready_blob_count,checkout_ready_blob_bytes,checkout_spilled_blob_count,checkout_spilled_blob_bytes,checkout_missing_blob_count,reconstructed_object_count,pipeline_enabled,pipeline_frame_count,pipeline_checkout_wait_ms,pipeline_peak_pending_delta_count,pipeline_arena_spill_bytes,target_bytes,rss_bytes,git_trace_path,git_remote_ms,git_index_pack_ms,git_checkout_ms,git_trace_parse_error,validated"
         );
     }
 
@@ -173,6 +183,11 @@ fn run_git_bench(
     if cli.validate {
         validate_repo(&target)?;
     }
+    let git_trace = match trace_path.as_deref().map(parse_git_trace2).transpose() {
+        Ok(Some(summary)) => summary,
+        Ok(None) => GitTraceSummary::default(),
+        Err(error) => GitTraceSummary::parse_error(error.to_string()),
+    };
     let result = BenchResult {
         tool: "git",
         run,
@@ -206,9 +221,18 @@ fn run_git_bench(
         checkout_spilled_blob_bytes: None,
         checkout_missing_blob_count: None,
         reconstructed_object_count: None,
+        pipeline_enabled: false,
+        pipeline_frame_count: None,
+        pipeline_checkout_wait_ms: None,
+        pipeline_peak_pending_delta_count: None,
+        pipeline_arena_spill_bytes: None,
         target_bytes: target_size(&target).ok(),
         rss_bytes: None,
         git_trace_path: trace_path,
+        git_remote_ms: git_trace.remote_ms,
+        git_index_pack_ms: git_trace.index_pack_ms,
+        git_checkout_ms: git_trace.checkout_ms,
+        git_trace_parse_error: git_trace.parse_error,
         validated: cli.validate,
     };
     print_result(cli, &result);
@@ -251,9 +275,18 @@ impl BenchResult {
             checkout_spilled_blob_bytes: Some(report.checkout_spilled_blob_bytes),
             checkout_missing_blob_count: Some(report.checkout_missing_blob_count),
             reconstructed_object_count: Some(report.reconstructed_object_count),
+            pipeline_enabled: report.pipeline_enabled,
+            pipeline_frame_count: report.pipeline_frame_count,
+            pipeline_checkout_wait_ms: report.pipeline_checkout_wait_ms,
+            pipeline_peak_pending_delta_count: report.pipeline_peak_pending_delta_count,
+            pipeline_arena_spill_bytes: report.pipeline_arena_spill_bytes,
             target_bytes: Some(report.target_bytes),
             rss_bytes: report.rss_bytes,
             git_trace_path: None,
+            git_remote_ms: None,
+            git_index_pack_ms: None,
+            git_checkout_ms: None,
+            git_trace_parse_error: None,
             validated,
         }
     }
@@ -340,6 +373,175 @@ fn run_git_clone(url: &str, target: &Path, trace_path: Option<&Path>) -> Result<
     Ok(())
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GitTraceSummary {
+    remote_ms: Option<u128>,
+    index_pack_ms: Option<u128>,
+    checkout_ms: Option<u128>,
+    parse_error: Option<String>,
+}
+
+impl GitTraceSummary {
+    fn parse_error(error: String) -> Self {
+        Self {
+            parse_error: Some(error),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitChildPhase {
+    Remote,
+    IndexPack,
+}
+
+fn parse_git_trace2(path: &Path) -> Result<GitTraceSummary, CloneError> {
+    let content = fs::read_to_string(path).map_err(|error| CloneError::BenchmarkFailed {
+        operation: "reading git Trace2 output",
+        detail: format!("{}: {error}", path.display()),
+    })?;
+    Ok(parse_git_trace2_content(&content))
+}
+
+fn parse_git_trace2_content(content: &str) -> GitTraceSummary {
+    let mut children = HashMap::<String, GitChildPhase>::new();
+    let mut remote_ms = 0u128;
+    let mut index_pack_ms = 0u128;
+    let mut checkout_ms = 0u128;
+    let mut saw_remote = false;
+    let mut saw_index_pack = false;
+    let mut saw_checkout = false;
+    let mut malformed_lines = 0usize;
+
+    for line in content.lines() {
+        let Some(record) = Trace2Record::parse(line) else {
+            malformed_lines += 1;
+            continue;
+        };
+        if record.session != "d0" {
+            continue;
+        }
+        match record.event {
+            "child_start" => {
+                if let Some(child_id) = trace_child_id(record.message)
+                    && let Some(phase) = classify_git_child(record.message)
+                {
+                    children.insert(child_id.to_owned(), phase);
+                }
+            }
+            "child_exit" => {
+                if let Some(child_id) = trace_child_id(record.message)
+                    && let Some(phase) = children.remove(child_id)
+                    && let Some(duration_ms) = trace_seconds_to_ms(record.duration_seconds)
+                {
+                    match phase {
+                        GitChildPhase::Remote => {
+                            remote_ms += duration_ms;
+                            saw_remote = true;
+                        }
+                        GitChildPhase::IndexPack => {
+                            index_pack_ms += duration_ms;
+                            saw_index_pack = true;
+                        }
+                    }
+                }
+            }
+            "region_leave" => {
+                if is_checkout_region(record.category, record.message)
+                    && let Some(duration_ms) = trace_seconds_to_ms(record.duration_seconds)
+                {
+                    checkout_ms += duration_ms;
+                    saw_checkout = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    GitTraceSummary {
+        remote_ms: saw_remote.then_some(remote_ms),
+        index_pack_ms: saw_index_pack.then_some(index_pack_ms),
+        checkout_ms: saw_checkout.then_some(checkout_ms),
+        parse_error: (malformed_lines > 0)
+            .then(|| format!("ignored {malformed_lines} malformed Trace2 lines")),
+    }
+}
+
+#[derive(Debug)]
+struct Trace2Record<'a> {
+    session: &'a str,
+    event: &'a str,
+    duration_seconds: &'a str,
+    category: &'a str,
+    message: &'a str,
+}
+
+impl<'a> Trace2Record<'a> {
+    fn parse(line: &'a str) -> Option<Self> {
+        let fields = line.split('|').map(str::trim).collect::<Vec<_>>();
+        if fields.len() < 9 {
+            return None;
+        }
+        Some(Self {
+            session: fields[1],
+            event: fields[3],
+            duration_seconds: fields[6],
+            category: fields[7],
+            message: fields[8],
+        })
+    }
+}
+
+fn classify_git_child(message: &str) -> Option<GitChildPhase> {
+    if message.contains("remote-https") || message.contains("git-remote-https") {
+        Some(GitChildPhase::Remote)
+    } else if message.contains("index-pack") {
+        Some(GitChildPhase::IndexPack)
+    } else {
+        None
+    }
+}
+
+fn trace_child_id(message: &str) -> Option<&str> {
+    let start = message.find("[ch")? + 1;
+    let end = message[start..].find(']')? + start;
+    Some(&message[start..end])
+}
+
+fn trace_seconds_to_ms(raw: &str) -> Option<u128> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('-') {
+        return None;
+    }
+    let (seconds, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    let seconds = seconds.parse::<u128>().ok()?;
+    let mut fraction_digits = fraction
+        .chars()
+        .take(4)
+        .map(|character| character.to_digit(10))
+        .collect::<Option<Vec<_>>>()?;
+    while fraction_digits.len() < 4 {
+        fraction_digits.push(0);
+    }
+    let milliseconds = u128::from(fraction_digits[0]) * 100
+        + u128::from(fraction_digits[1]) * 10
+        + u128::from(fraction_digits[2]);
+    let rounded_milliseconds = milliseconds + u128::from(fraction_digits[3] >= 5);
+    seconds.checked_mul(1000)?.checked_add(rounded_milliseconds)
+}
+
+fn is_checkout_region(category: &str, message: &str) -> bool {
+    let category = category.to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    category.contains("unpack_trees")
+        || category.contains("checkout")
+        || message.contains("unpack_trees")
+        || message.contains("checkout")
+        || message.contains("updating files")
+        || message.contains("filtering content")
+}
+
 fn validate_repo(target: &Path) -> Result<(), CloneError> {
     run_git_validation(target, &["fsck", "--full"])?;
     run_git_validation(target, &["status", "--short"])?;
@@ -383,7 +585,7 @@ fn print_result(cli: &BenchCli, result: &BenchResult) {
 
 fn print_json_result(url: &str, result: &BenchResult) {
     println!(
-        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"checkout_needed_blob_count\":{},\"checkout_ready_blob_count\":{},\"checkout_ready_blob_bytes\":{},\"checkout_spilled_blob_count\":{},\"checkout_spilled_blob_bytes\":{},\"checkout_missing_blob_count\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"validated\":{}}}",
+        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"checkout_needed_blob_count\":{},\"checkout_ready_blob_count\":{},\"checkout_ready_blob_bytes\":{},\"checkout_spilled_blob_count\":{},\"checkout_spilled_blob_bytes\":{},\"checkout_missing_blob_count\":{},\"reconstructed_object_count\":{},\"pipeline_enabled\":{},\"pipeline_frame_count\":{},\"pipeline_checkout_wait_ms\":{},\"pipeline_peak_pending_delta_count\":{},\"pipeline_arena_spill_bytes\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"git_remote_ms\":{},\"git_index_pack_ms\":{},\"git_checkout_ms\":{},\"git_trace_parse_error\":{},\"validated\":{}}}",
         escape_json(url),
         result.tool,
         result.run,
@@ -417,20 +619,28 @@ fn print_json_result(url: &str, result: &BenchResult) {
         option_usize(result.checkout_spilled_blob_bytes),
         option_usize(result.checkout_missing_blob_count),
         option_usize(result.reconstructed_object_count),
+        result.pipeline_enabled,
+        option_usize(result.pipeline_frame_count),
+        option_u128(result.pipeline_checkout_wait_ms),
+        option_usize(result.pipeline_peak_pending_delta_count),
+        option_u64(result.pipeline_arena_spill_bytes),
         option_u64(result.target_bytes),
         option_u64(result.rss_bytes),
         option_path(result.git_trace_path.as_deref()),
+        option_u128(result.git_remote_ms),
+        option_u128(result.git_index_pack_ms),
+        option_u128(result.git_checkout_ms),
+        option_string(result.git_trace_parse_error.as_deref()),
         result.validated
     );
 }
 
 fn print_csv_result(url: &str, result: &BenchResult) {
-    println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        url,
-        result.tool,
-        result.run,
-        result.total_ms,
+    let fields = vec![
+        url.to_owned(),
+        result.tool.to_owned(),
+        result.run.to_string(),
+        result.total_ms.to_string(),
         csv_u128(result.discovery_ms),
         csv_u128(result.fetch_ms),
         csv_u128(result.ingest_ms),
@@ -460,16 +670,26 @@ fn print_csv_result(url: &str, result: &BenchResult) {
         csv_usize(result.checkout_spilled_blob_bytes),
         csv_usize(result.checkout_missing_blob_count),
         csv_usize(result.reconstructed_object_count),
+        result.pipeline_enabled.to_string(),
+        csv_usize(result.pipeline_frame_count),
+        csv_u128(result.pipeline_checkout_wait_ms),
+        csv_usize(result.pipeline_peak_pending_delta_count),
+        csv_u64(result.pipeline_arena_spill_bytes),
         csv_u64(result.target_bytes),
         csv_u64(result.rss_bytes),
         csv_path(result.git_trace_path.as_deref()),
-        result.validated
-    );
+        csv_u128(result.git_remote_ms),
+        csv_u128(result.git_index_pack_ms),
+        csv_u128(result.git_checkout_ms),
+        csv_string(result.git_trace_parse_error.as_deref()),
+        result.validated.to_string(),
+    ];
+    println!("{}", fields.join(","));
 }
 
 fn print_plain_result(result: &BenchResult) {
     println!(
-        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} checkout_needed_blobs={} checkout_ready_blobs={} checkout_ready_blob_bytes={} checkout_spilled_blobs={} checkout_spilled_blob_bytes={} checkout_missing_blobs={} reconstructed_objects={} target_bytes={} rss={} git_trace={} validated={}",
+        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} checkout_needed_blobs={} checkout_ready_blobs={} checkout_ready_blob_bytes={} checkout_spilled_blobs={} checkout_spilled_blob_bytes={} checkout_missing_blobs={} reconstructed_objects={} pipeline_enabled={} pipeline_frames={} pipeline_checkout_wait={} pipeline_peak_pending_deltas={} pipeline_arena_spill_bytes={} target_bytes={} rss={} git_trace={} git_remote={} git_index_pack={} git_checkout={} git_trace_parse_error={} validated={}",
         result.tool,
         result.run,
         result.total_ms,
@@ -502,9 +722,18 @@ fn print_plain_result(result: &BenchResult) {
         usize_or_dash(result.checkout_spilled_blob_bytes),
         usize_or_dash(result.checkout_missing_blob_count),
         usize_or_dash(result.reconstructed_object_count),
+        result.pipeline_enabled,
+        usize_or_dash(result.pipeline_frame_count),
+        ms_or_dash(result.pipeline_checkout_wait_ms),
+        usize_or_dash(result.pipeline_peak_pending_delta_count),
+        u64_or_dash(result.pipeline_arena_spill_bytes),
         u64_or_dash(result.target_bytes),
         u64_or_dash(result.rss_bytes),
         path_or_dash(result.git_trace_path.as_deref()),
+        ms_or_dash(result.git_remote_ms),
+        ms_or_dash(result.git_index_pack_ms),
+        ms_or_dash(result.git_checkout_ms),
+        string_or_dash(result.git_trace_parse_error.as_deref()),
         result.validated
     );
 }
@@ -582,6 +811,13 @@ fn option_path(value: Option<&Path>) -> String {
     )
 }
 
+fn option_string(value: Option<&str>) -> String {
+    value.map_or_else(
+        || "null".to_owned(),
+        |value| format!("\"{}\"", escape_json(value)),
+    )
+}
+
 fn csv_u128(value: Option<u128>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
 }
@@ -600,6 +836,10 @@ fn csv_bool(value: Option<bool>) -> String {
 
 fn csv_path(value: Option<&Path>) -> String {
     value.map_or_else(String::new, |value| value.display().to_string())
+}
+
+fn csv_string(value: Option<&str>) -> String {
+    value.map_or_else(String::new, ToOwned::to_owned)
 }
 
 fn ms_or_dash(value: Option<u128>) -> String {
@@ -622,14 +862,24 @@ fn path_or_dash(value: Option<&Path>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.display().to_string())
 }
 
+fn string_or_dash(value: Option<&str>) -> String {
+    value.map_or_else(|| "-".to_owned(), ToOwned::to_owned)
+}
+
 fn escape_json(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchOrder, TimingSummary, csv_path, option_path, run_git_first};
+    use super::{
+        BenchOrder, GitTraceSummary, TimingSummary, csv_path, option_path,
+        parse_git_trace2_content, run_git_first,
+    };
     use std::path::Path;
+
+    const TRACE_PREFIX: &str =
+        "00:00:00.000000 file.c:1                 | d0 | main                     |";
 
     #[test]
     fn timing_summary_should_report_median_min_and_max_for_odd_samples() {
@@ -679,5 +929,77 @@ mod tests {
     #[test]
     fn path_output_should_escape_json_path() {
         assert_eq!(option_path(Some(Path::new("a\"b"))), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn trace2_parser_should_pair_child_start_and_exit() {
+        let trace = format!(
+            "{TRACE_PREFIX} child_start  |     |  0.010000 |           |              | [ch0] class:remote-https argv:[git remote-https origin https://example.com/repo.git]\n\
+             {TRACE_PREFIX} child_exit   |     |  0.110000 |  0.100000 |              | [ch0] pid:1 code:0"
+        );
+
+        let summary = parse_git_trace2_content(&trace);
+
+        assert_eq!(summary.remote_ms, Some(100));
+        assert_eq!(summary.index_pack_ms, None);
+        assert_eq!(summary.parse_error, None);
+    }
+
+    #[test]
+    fn trace2_parser_should_classify_remote_https_and_index_pack() {
+        let trace = format!(
+            "{TRACE_PREFIX} child_start  |     |  0.010000 |           |              | [ch0] class:remote-https argv:[git remote-https origin https://example.com/repo.git]\n\
+             {TRACE_PREFIX} child_exit   |     |  0.110000 |  0.100000 |              | [ch0] pid:1 code:0\n\
+             {TRACE_PREFIX} child_start  |     |  0.120000 |           |              | [ch1] class:? argv:[git index-pack --stdin]\n\
+             {TRACE_PREFIX} child_exit   |     |  0.320000 |  0.200000 |              | [ch1] pid:2 code:0"
+        );
+
+        let summary = parse_git_trace2_content(&trace);
+
+        assert_eq!(summary.remote_ms, Some(100));
+        assert_eq!(summary.index_pack_ms, Some(200));
+    }
+
+    #[test]
+    fn trace2_parser_should_sum_checkout_regions_when_present() {
+        let trace = format!(
+            "{TRACE_PREFIX} region_leave | r1  |  0.200000 |  0.050000 | unpack_trees | label:unpack_trees\n\
+             {TRACE_PREFIX} region_leave | r1  |  0.300000 |  0.025000 | checkout     | label:writing-files"
+        );
+
+        let summary = parse_git_trace2_content(&trace);
+
+        assert_eq!(summary.checkout_ms, Some(75));
+    }
+
+    #[test]
+    fn trace2_parser_should_ignore_unknown_or_malformed_lines() {
+        let trace = format!(
+            "not trace2\n\
+             {TRACE_PREFIX} child_start  |     |  0.010000 |           |              | [ch0] class:unknown argv:[git status]\n\
+             {TRACE_PREFIX} child_exit   |     |  0.110000 |  0.100000 |              | [ch0] pid:1 code:0"
+        );
+
+        let summary = parse_git_trace2_content(&trace);
+
+        assert_eq!(summary.remote_ms, None);
+        assert_eq!(summary.index_pack_ms, None);
+        assert_eq!(
+            summary.parse_error,
+            Some("ignored 1 malformed Trace2 lines".to_owned())
+        );
+    }
+
+    #[test]
+    fn trace2_columns_should_be_empty_without_git_trace2() {
+        assert_eq!(
+            GitTraceSummary::default(),
+            GitTraceSummary {
+                remote_ms: None,
+                index_pack_ms: None,
+                checkout_ms: None,
+                parse_error: None,
+            }
+        );
     }
 }

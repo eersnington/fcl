@@ -156,13 +156,7 @@ fn collect_tree_manifest(
             }
             TreeEntryMode::Gitlink => {}
             TreeEntryMode::File | TreeEntryMode::Executable | TreeEntryMode::Symlink => {
-                let object = object_reader.get_meta(entry.oid).ok_or_else(|| {
-                    CloneError::ObjectLookupFailed {
-                        oid: entry.oid.to_hex(),
-                        expected_type: "blob",
-                        detail: "object was not present in the fetched pack".to_owned(),
-                    }
-                })?;
+                let object = object_reader.read_meta(entry.oid)?;
                 if object.object_type != ObjectType::Blob {
                     return Err(CloneError::ObjectLookupFailed {
                         oid: entry.oid.to_hex(),
@@ -615,8 +609,15 @@ mod tests {
     }
 
     impl ObjectReader for FakeObjectReader {
-        fn get_meta(&self, oid: ObjectId) -> Option<&ObjectMeta> {
-            self.meta.get(&oid)
+        fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError> {
+            self.meta
+                .get(&oid)
+                .cloned()
+                .ok_or_else(|| CloneError::ObjectLookupFailed {
+                    oid: oid.to_hex(),
+                    expected_type: "object",
+                    detail: "fake reader did not contain object metadata".to_owned(),
+                })
         }
 
         fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError> {

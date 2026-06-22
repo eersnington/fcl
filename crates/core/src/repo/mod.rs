@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::CloneError;
 use crate::protocol::{Remote, RemoteRef};
@@ -7,6 +8,13 @@ use crate::protocol::{Remote, RemoteRef};
 #[derive(Debug)]
 pub struct RepoLayout {
     root: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct FinalizingRepo {
+    layout: Option<RepoLayout>,
+    final_target: PathBuf,
+    committed: bool,
 }
 
 impl RepoLayout {
@@ -109,6 +117,80 @@ impl RepoLayout {
     }
 }
 
+impl FinalizingRepo {
+    pub fn create(final_target: &Path) -> Result<Self, CloneError> {
+        if final_target.exists() {
+            return Err(CloneError::TargetAlreadyExists {
+                path: final_target.to_owned(),
+            });
+        }
+        let staging = staging_path(final_target);
+        let layout = RepoLayout::create(&staging)?;
+        Ok(Self {
+            layout: Some(layout),
+            final_target: final_target.to_owned(),
+            committed: false,
+        })
+    }
+
+    pub fn layout(&self) -> Result<&RepoLayout, CloneError> {
+        self.layout.as_ref().ok_or_else(|| {
+            CloneError::repo_layout(
+                self.final_target.clone(),
+                "accessing staged repository layout",
+                std::io::Error::other("staged repository was already committed"),
+            )
+        })
+    }
+
+    pub fn commit(mut self) -> Result<RepoLayout, CloneError> {
+        let layout = self.layout.take().ok_or_else(|| {
+            CloneError::repo_layout(
+                self.final_target.clone(),
+                "publishing staged repository",
+                std::io::Error::other("staged repository was already committed"),
+            )
+        })?;
+        fs::rename(layout.root(), &self.final_target).map_err(|source| {
+            CloneError::repo_layout(
+                self.final_target.clone(),
+                "publishing staged repository",
+                source,
+            )
+        })?;
+        self.committed = true;
+        Ok(RepoLayout {
+            root: self.final_target.clone(),
+        })
+    }
+}
+
+impl Drop for FinalizingRepo {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(layout) = &self.layout {
+            let _ = fs::remove_dir_all(layout.root());
+        }
+    }
+}
+
+fn staging_path(final_target: &Path) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let name = final_target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fcl-target");
+    let staging_name = format!(".{name}.fcl-staging-{}-{stamp}", std::process::id());
+    final_target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(staging_name)
+}
+
 fn write_packed_refs(path: &Path, mut refs: Vec<(String, &str)>) -> Result<(), CloneError> {
     refs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let mut content = String::from("# pack-refs with: sorted\n");
@@ -130,4 +212,63 @@ fn write_ref(path: &Path, oid: &str) -> Result<(), CloneError> {
     }
     fs::write(path, format!("{oid}\n"))
         .map_err(|source| CloneError::repo_layout(path.to_owned(), "writing ref", source))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::FinalizingRepo;
+
+    #[test]
+    fn staged_repo_should_publish_only_on_commit() {
+        let temp = test_temp_dir("staged-publish");
+        let target = temp.join("repo");
+        let staged = FinalizingRepo::create(&target).expect("staged repo should be created");
+        let staging_root = staged
+            .layout()
+            .expect("layout should exist")
+            .root()
+            .to_owned();
+
+        assert!(!target.exists());
+        assert!(staging_root.exists());
+
+        let published = staged.commit().expect("staged repo should publish");
+
+        assert_eq!(published.root(), target.as_path());
+        assert!(target.join(".git").exists());
+        assert!(!staging_root.exists());
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn staged_repo_should_cleanup_after_failure() {
+        let temp = test_temp_dir("staged-cleanup");
+        let target = temp.join("repo");
+        let staging_root = {
+            let staged = FinalizingRepo::create(&target).expect("staged repo should be created");
+            staged
+                .layout()
+                .expect("layout should exist")
+                .root()
+                .to_owned()
+        };
+
+        assert!(!target.exists());
+        assert!(!staging_root.exists());
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("fcl-{name}-{}-{stamp}", std::process::id()));
+        fs::create_dir(&path).expect("test temp directory should be created");
+        path
+    }
 }

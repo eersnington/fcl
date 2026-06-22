@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -97,7 +99,7 @@ pub struct ObjectMeta {
 }
 
 pub trait ObjectReader: Sync {
-    fn get_meta(&self, oid: ObjectId) -> Option<&ObjectMeta>;
+    fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError>;
     fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError>;
     fn stream_blob(&self, oid: ObjectId, out: &mut dyn Write) -> Result<u64, CloneError>;
 }
@@ -144,6 +146,10 @@ pub struct PackIngestReport {
     pub checkout_spilled_blob_count: usize,
     pub checkout_spilled_blob_bytes: usize,
     pub checkout_missing_blob_count: usize,
+    pub pipeline_frame_count: Option<usize>,
+    pub pipeline_checkout_wait_ms: Option<u128>,
+    pub pipeline_peak_pending_delta_count: Option<usize>,
+    pub pipeline_arena_spill_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -156,10 +162,55 @@ pub struct CheckoutHint {
     pub default_commit: ObjectId,
 }
 
+#[derive(Debug)]
+pub enum PipelineEvent {
+    Frame(ObjectFrame),
+    Finished {
+        checksum: [u8; 20],
+        pack_bytes: u64,
+        scan_ms: u128,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineObjectStore {
+    pack_path: PathBuf,
+    inner: Arc<PipelineObjectStoreInner>,
+}
+
+#[derive(Debug)]
+struct PipelineObjectStoreInner {
+    state: Mutex<PipelineObjectStoreState>,
+    ready: Condvar,
+    wait_ms: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct PipelineObjectStoreState {
+    meta_by_oid: HashMap<ObjectId, ObjectMeta>,
+    state_by_oid: HashMap<ObjectId, ObjectDataState>,
+    complete: bool,
+    failure: Option<PipelineFailure>,
+    retained_object_count: usize,
+    retained_object_bytes: usize,
+    spilled_object_count: usize,
+    spilled_object_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PipelineFailure {
+    operation: &'static str,
+    detail: String,
+}
+
 #[derive(Debug, Clone)]
 enum ObjectDataState {
     Resident(Arc<[u8]>),
-    Spilled { path: PathBuf, len: u64 },
+    Spilled {
+        path: PathBuf,
+        offset: u64,
+        len: u64,
+    },
     Reconstructable,
 }
 
@@ -198,6 +249,198 @@ impl PackIndex {
     pub fn reconstructed_object_count(&self) -> usize {
         self.reconstructed_object_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl PipelineObjectStore {
+    pub fn new(pack_path: &Path) -> Self {
+        Self {
+            pack_path: pack_path.to_owned(),
+            inner: Arc::new(PipelineObjectStoreInner {
+                state: Mutex::new(PipelineObjectStoreState::default()),
+                ready: Condvar::new(),
+                wait_ms: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    pub fn checkout_wait_ms(&self) -> u128 {
+        u128::from(self.inner.wait_ms.load(Ordering::Relaxed))
+    }
+
+    fn publish_object(
+        &self,
+        oid: ObjectId,
+        meta: ObjectMeta,
+        object_state: ObjectDataState,
+        retained_bytes: usize,
+        spilled_bytes: usize,
+    ) -> Result<(), CloneError> {
+        let mut state = self.lock_state("publishing pipeline object")?;
+        state.meta_by_oid.insert(oid, meta);
+        match &object_state {
+            ObjectDataState::Resident(_) => {
+                state.retained_object_count += 1;
+                state.retained_object_bytes =
+                    state.retained_object_bytes.saturating_add(retained_bytes);
+            }
+            ObjectDataState::Spilled { .. } => {
+                state.spilled_object_count += 1;
+                state.spilled_object_bytes =
+                    state.spilled_object_bytes.saturating_add(spilled_bytes);
+            }
+            ObjectDataState::Reconstructable => {}
+        }
+        state.state_by_oid.insert(oid, object_state);
+        drop(state);
+        self.inner.ready.notify_all();
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<PipelineObjectStoreState, CloneError> {
+        let mut state = self.lock_state("finishing pipeline object store")?;
+        state.complete = true;
+        self.inner.ready.notify_all();
+        Ok(state.clone())
+    }
+
+    pub(crate) fn fail(&self, operation: &'static str, detail: String) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.failure = Some(PipelineFailure { operation, detail });
+            state.complete = true;
+            self.inner.ready.notify_all();
+        }
+    }
+
+    fn lock_state(
+        &self,
+        operation: &'static str,
+    ) -> Result<std::sync::MutexGuard<'_, PipelineObjectStoreState>, CloneError> {
+        self.inner
+            .state
+            .lock()
+            .map_err(|error| CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation,
+                detail: error.to_string(),
+            })
+    }
+
+    fn wait_for<T>(
+        &self,
+        oid: ObjectId,
+        expected_type: &'static str,
+        mut read: impl FnMut(&PipelineObjectStoreState) -> Option<T>,
+    ) -> Result<T, CloneError> {
+        let start = Instant::now();
+        let mut state = self.lock_state("waiting for pipeline object")?;
+        loop {
+            if let Some(value) = read(&state) {
+                self.inner.wait_ms.fetch_add(
+                    u64_saturating_from_u128(start.elapsed().as_millis()),
+                    Ordering::Relaxed,
+                );
+                return Ok(value);
+            }
+            if let Some(failure) = &state.failure {
+                return Err(CloneError::PackIndexFailed {
+                    path: self.pack_path.clone(),
+                    operation: failure.operation,
+                    detail: failure.detail.clone(),
+                });
+            }
+            if state.complete {
+                return Err(CloneError::ObjectLookupFailed {
+                    oid: oid.to_hex(),
+                    expected_type,
+                    detail: "pipeline completed before the object became available".to_owned(),
+                });
+            }
+            state = self
+                .inner
+                .ready
+                .wait(state)
+                .map_err(|error| CloneError::PackIndexFailed {
+                    path: self.pack_path.clone(),
+                    operation: "waiting for pipeline object",
+                    detail: error.to_string(),
+                })?;
+        }
+    }
+}
+
+impl ObjectReader for PipelineObjectStore {
+    fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError> {
+        self.wait_for(oid, "object", |state| state.meta_by_oid.get(&oid).cloned())
+    }
+
+    fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError> {
+        let (meta, object_state) = self.wait_for(oid, "object", |state| {
+            Some((
+                state.meta_by_oid.get(&oid)?.clone(),
+                state.state_by_oid.get(&oid)?.clone(),
+            ))
+        })?;
+        let data = match object_state {
+            ObjectDataState::Resident(data) => data,
+            ObjectDataState::Spilled { path, offset, len } => {
+                read_spilled_object(&path, offset, len)?
+            }
+            ObjectDataState::Reconstructable => {
+                return Err(CloneError::ObjectLookupFailed {
+                    oid: oid.to_hex(),
+                    expected_type: "resident pipeline object",
+                    detail: "pipeline object was marked reconstructable before final index was available"
+                        .to_owned(),
+                });
+            }
+        };
+        Ok(ObjectBytes {
+            object_type: meta.object_type,
+            data,
+        })
+    }
+
+    fn stream_blob(&self, oid: ObjectId, out: &mut dyn Write) -> Result<u64, CloneError> {
+        let (meta, object_state) = self.wait_for(oid, "blob", |state| {
+            Some((
+                state.meta_by_oid.get(&oid)?.clone(),
+                state.state_by_oid.get(&oid)?.clone(),
+            ))
+        })?;
+        if meta.object_type != ObjectType::Blob {
+            return Err(CloneError::ObjectLookupFailed {
+                oid: oid.to_hex(),
+                expected_type: "blob",
+                detail: format!("found {}", meta.object_type.as_git_name()),
+            });
+        }
+        match object_state {
+            ObjectDataState::Resident(data) => {
+                out.write_all(&data)
+                    .map_err(|error| CloneError::PackIndexFailed {
+                        path: self.pack_path.clone(),
+                        operation: "streaming resident pipeline blob",
+                        detail: error.to_string(),
+                    })?;
+                Ok(data.len() as u64)
+            }
+            ObjectDataState::Spilled { path, offset, len } => {
+                let mut file = File::open(&path).map_err(|error| CloneError::PackIndexFailed {
+                    path: path.clone(),
+                    operation: "opening spilled pipeline blob",
+                    detail: error.to_string(),
+                })?;
+                copy_exact_range(&path, &mut file, offset, len, out)?;
+                Ok(len)
+            }
+            ObjectDataState::Reconstructable => Err(CloneError::ObjectLookupFailed {
+                oid: oid.to_hex(),
+                expected_type: "resident pipeline blob",
+                detail: "pipeline blob was marked reconstructable before final index was available"
+                    .to_owned(),
+            }),
+        }
     }
 }
 
@@ -268,8 +511,15 @@ impl PackStorage {
 }
 
 impl ObjectReader for PackIndex {
-    fn get_meta(&self, oid: ObjectId) -> Option<&ObjectMeta> {
-        self.meta_by_oid.get(&oid)
+    fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError> {
+        self.meta_by_oid
+            .get(&oid)
+            .cloned()
+            .ok_or_else(|| CloneError::ObjectLookupFailed {
+                oid: oid.to_hex(),
+                expected_type: "object",
+                detail: "object was not present in the fetched pack".to_owned(),
+            })
     }
 
     fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError> {
@@ -283,7 +533,9 @@ impl ObjectReader for PackIndex {
             })?;
         let data = match self.state_by_oid.get(&oid) {
             Some(ObjectDataState::Resident(data)) => Arc::clone(data),
-            Some(ObjectDataState::Spilled { path, len }) => read_spilled_object(path, *len)?,
+            Some(ObjectDataState::Spilled { path, offset, len }) => {
+                read_spilled_object(path, *offset, *len)?
+            }
             Some(ObjectDataState::Reconstructable) | None => {
                 self.reconstructed_object_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -322,17 +574,13 @@ impl ObjectReader for PackIndex {
                     })?;
                 Ok(data.len() as u64)
             }
-            Some(ObjectDataState::Spilled { path, len }) => {
+            Some(ObjectDataState::Spilled { path, offset, len }) => {
                 let mut file = File::open(path).map_err(|error| CloneError::PackIndexFailed {
                     path: path.clone(),
                     operation: "opening spilled blob",
                     detail: error.to_string(),
                 })?;
-                std::io::copy(&mut file, out).map_err(|error| CloneError::PackIndexFailed {
-                    path: path.clone(),
-                    operation: "streaming spilled blob",
-                    detail: error.to_string(),
-                })?;
+                copy_exact_range(path, &mut file, *offset, *len, out)?;
                 Ok(*len)
             }
             Some(ObjectDataState::Reconstructable) | None => {
@@ -413,13 +661,15 @@ impl PackIndex {
     ) -> Result<Arc<[u8]>, CloneError> {
         match self.state_by_oid.get(&oid) {
             Some(ObjectDataState::Resident(data)) => Ok(Arc::clone(data)),
-            Some(ObjectDataState::Spilled { path, len }) => read_spilled_object(path, *len),
+            Some(ObjectDataState::Spilled { path, offset, len }) => {
+                read_spilled_object(path, *offset, *len)
+            }
             Some(ObjectDataState::Reconstructable) | None => self.reconstruct_object(oid, depth),
         }
     }
 }
 
-fn read_spilled_object(path: &Path, len: u64) -> Result<Arc<[u8]>, CloneError> {
+fn read_spilled_object(path: &Path, offset: u64, len: u64) -> Result<Arc<[u8]>, CloneError> {
     let mut file = File::open(path).map_err(|error| CloneError::PackIndexFailed {
         path: path.to_owned(),
         operation: "opening spilled object",
@@ -430,12 +680,7 @@ fn read_spilled_object(path: &Path, len: u64) -> Result<Arc<[u8]>, CloneError> {
         "allocating spilled object buffer",
         len,
     )?);
-    file.read_to_end(&mut data)
-        .map_err(|error| CloneError::PackIndexFailed {
-            path: path.to_owned(),
-            operation: "reading spilled object",
-            detail: error.to_string(),
-        })?;
+    copy_exact_range(path, &mut file, offset, len, &mut data)?;
     if data.len() as u64 != len {
         return Err(CloneError::PackIndexFailed {
             path: path.to_owned(),
@@ -444,6 +689,54 @@ fn read_spilled_object(path: &Path, len: u64) -> Result<Arc<[u8]>, CloneError> {
         });
     }
     Ok(data.into())
+}
+
+fn copy_exact_range(
+    path: &Path,
+    file: &mut File,
+    offset: u64,
+    len: u64,
+    out: &mut dyn Write,
+) -> Result<(), CloneError> {
+    use std::io::{Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: path.to_owned(),
+            operation: "seeking spilled object",
+            detail: error.to_string(),
+        })?;
+    let mut remaining = len;
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = buffer.len().min(usize_from_u64(
+            path,
+            "reading spilled object range",
+            remaining,
+        )?);
+        let read =
+            file.read(&mut buffer[..to_read])
+                .map_err(|error| CloneError::PackIndexFailed {
+                    path: path.to_owned(),
+                    operation: "reading spilled object",
+                    detail: error.to_string(),
+                })?;
+        if read == 0 {
+            return Err(CloneError::PackIndexFailed {
+                path: path.to_owned(),
+                operation: "reading spilled object",
+                detail: format!("spilled object ended with {remaining} bytes remaining"),
+            });
+        }
+        out.write_all(&buffer[..read])
+            .map_err(|error| CloneError::PackIndexFailed {
+                path: path.to_owned(),
+                operation: "copying spilled object",
+                detail: error.to_string(),
+            })?;
+        remaining -= read as u64;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,22 +822,20 @@ pub fn ingest_fetched_pack(
     checksum: [u8; 20],
     options: PackIngestOptions,
 ) -> Result<PackIngestReport, CloneError> {
-    let pack = read_pack_arc(pack_path)?;
-
     let scan_payload = if env_bool("FCL_LOW_MEMORY") {
         ScanPayload::MetadataOnly
     } else {
         ScanPayload::Inflate
     };
     let scan_start = Instant::now();
-    let scan = scan_pack_with_checksum(pack_path, pack.as_ref(), scan_payload, checksum)?;
+    let scan = scan_pack_file_windowed(pack_path, scan_payload, checksum)?;
     let scan_ms = scan_start.elapsed().as_millis();
-    drop(pack);
 
     let pack = PackStorage::open_file_backed(pack_path)?;
     ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms, options)
 }
 
+#[cfg(test)]
 pub fn read_pack_arc(pack_path: &Path) -> Result<Arc<[u8]>, CloneError> {
     let pack = fs::read(pack_path).map_err(|error| CloneError::PackIndexFailed {
         path: pack_path.to_owned(),
@@ -643,7 +934,321 @@ pub fn ingest_scanned_pack(
         checkout_spilled_blob_count: cache.checkout_spilled_blob_count,
         checkout_spilled_blob_bytes: cache.checkout_spilled_blob_bytes,
         checkout_missing_blob_count: cache.checkout_missing_blob_count,
+        pipeline_frame_count: None,
+        pipeline_checkout_wait_ms: None,
+        pipeline_peak_pending_delta_count: None,
+        pipeline_arena_spill_bytes: None,
     })
+}
+
+pub fn ingest_pack_pipeline(
+    pack_path: &Path,
+    index_path: &Path,
+    receiver: Receiver<PipelineEvent>,
+    store: PipelineObjectStore,
+) -> Result<PackIngestReport, CloneError> {
+    let start = Instant::now();
+    let spill_dir = index_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("fcl-spill");
+    let mut resolver = PipelineResolver::new(pack_path, index_path, &spill_dir, store)?;
+    let mut checksum = None;
+    let mut scan_ms = 0u128;
+    for event in receiver {
+        match event {
+            PipelineEvent::Frame(frame) => resolver.accept_frame(frame)?,
+            PipelineEvent::Finished {
+                checksum: received_checksum,
+                pack_bytes,
+                scan_ms: received_scan_ms,
+            } => {
+                let _ = pack_bytes;
+                checksum = Some(received_checksum);
+                scan_ms = received_scan_ms;
+                break;
+            }
+        }
+    }
+    let Some(checksum) = checksum else {
+        return Err(CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "resolving pipeline pack",
+            detail: "fetch completed without sending a pack checksum".to_owned(),
+        });
+    };
+    resolver.finish(checksum, scan_ms, start.elapsed().as_millis())
+}
+
+struct PipelineResolver {
+    pack_path: PathBuf,
+    index_path: PathBuf,
+    spill_dir: PathBuf,
+    store: PipelineObjectStore,
+    frames: Vec<ObjectFrame>,
+    entries: Vec<IndexEntry>,
+    oid_by_offset: HashMap<u64, ObjectId>,
+    resolved_by_offset: HashMap<u64, ResolvedObject>,
+    resolved_by_oid: HashMap<[u8; 20], ResolvedObject>,
+    pending_by_offset: HashMap<u64, Vec<PendingDelta>>,
+    pending_by_oid: HashMap<[u8; 20], Vec<PendingDelta>>,
+    frame_count: usize,
+    peak_pending_delta_count: usize,
+    arena_spill_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PendingDelta {
+    frame_index: usize,
+    frame: ObjectFrame,
+}
+
+impl PipelineResolver {
+    fn new(
+        pack_path: &Path,
+        index_path: &Path,
+        spill_dir: &Path,
+        store: PipelineObjectStore,
+    ) -> Result<Self, CloneError> {
+        fs::create_dir_all(spill_dir).map_err(|error| CloneError::PackIndexFailed {
+            path: spill_dir.to_owned(),
+            operation: "creating pipeline spill directory",
+            detail: error.to_string(),
+        })?;
+        Ok(Self {
+            pack_path: pack_path.to_owned(),
+            index_path: index_path.to_owned(),
+            spill_dir: spill_dir.to_owned(),
+            store,
+            frames: Vec::new(),
+            entries: Vec::new(),
+            oid_by_offset: HashMap::new(),
+            resolved_by_offset: HashMap::new(),
+            resolved_by_oid: HashMap::new(),
+            pending_by_offset: HashMap::new(),
+            pending_by_oid: HashMap::new(),
+            frame_count: 0,
+            peak_pending_delta_count: 0,
+            arena_spill_bytes: 0,
+        })
+    }
+
+    fn accept_frame(&mut self, frame: ObjectFrame) -> Result<(), CloneError> {
+        let frame_index = self.frames.len();
+        self.frames.push(frame.clone());
+        self.frame_count += 1;
+        match frame.encoded {
+            EncodedObjectKind::Base(object_type) => {
+                let payload = frame_payload_from_frame(&self.pack_path, &frame)?;
+                let resolved = ResolvedFrame {
+                    frame_index,
+                    offset: frame.offset,
+                    crc32: frame.crc32,
+                    object: resolve_base_object(object_type, payload),
+                };
+                self.publish_resolved(&resolved)?;
+            }
+            EncodedObjectKind::OffsetDelta { base_offset } => {
+                if let Some(base) = self.resolved_by_offset.get(&base_offset).cloned() {
+                    self.resolve_delta(frame_index, &frame, &base)?;
+                } else {
+                    self.pending_by_offset
+                        .entry(base_offset)
+                        .or_default()
+                        .push(PendingDelta { frame_index, frame });
+                    self.update_peak_pending();
+                }
+            }
+            EncodedObjectKind::RefDelta { base_oid } => {
+                if let Some(base) = self.resolved_by_oid.get(&base_oid).cloned() {
+                    self.resolve_delta(frame_index, &frame, &base)?;
+                } else {
+                    self.pending_by_oid
+                        .entry(base_oid)
+                        .or_default()
+                        .push(PendingDelta { frame_index, frame });
+                    self.update_peak_pending();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_delta(
+        &mut self,
+        frame_index: usize,
+        frame: &ObjectFrame,
+        base: &ResolvedObject,
+    ) -> Result<(), CloneError> {
+        let delta = frame_payload_from_frame(&self.pack_path, frame)?;
+        let data = apply_delta(&self.pack_path, &base.data, &delta)?;
+        let resolved = ResolvedFrame {
+            frame_index,
+            offset: frame.offset,
+            crc32: frame.crc32,
+            object: resolve_base_object(base.object_type, data.into()),
+        };
+        self.publish_resolved(&resolved)
+    }
+
+    fn publish_resolved(&mut self, resolved: &ResolvedFrame) -> Result<(), CloneError> {
+        let source = &self.frames[resolved.frame_index];
+        let oid = ObjectId::from_bytes(resolved.object.oid);
+        let delta_base = match source.encoded {
+            EncodedObjectKind::Base(_) => None,
+            EncodedObjectKind::OffsetDelta { base_offset } => Some(DeltaBase::Offset(base_offset)),
+            EncodedObjectKind::RefDelta { base_oid } => {
+                Some(DeltaBase::Oid(ObjectId::from_bytes(base_oid)))
+            }
+        };
+        let meta = ObjectMeta {
+            object_type: resolved.object.object_type,
+            size: resolved.object.size,
+            pack_inflated_size: source.declared_size,
+            pack_offset: resolved.offset,
+            compressed_start: source.compressed_start,
+            compressed_len: source.compressed_len,
+            crc32: resolved.crc32,
+            delta_base,
+        };
+        let data_len = resolved.object.data.len();
+        let object_state =
+            self.pipeline_object_state(&resolved.object.data, resolved.object.object_type)?;
+        let retained_bytes = if matches!(object_state, ObjectDataState::Resident(_)) {
+            data_len
+        } else {
+            0
+        };
+        let spilled_bytes = if matches!(object_state, ObjectDataState::Spilled { .. }) {
+            data_len
+        } else {
+            0
+        };
+        self.store
+            .publish_object(oid, meta, object_state, retained_bytes, spilled_bytes)?;
+        self.entries.push(IndexEntry {
+            oid: resolved.object.oid,
+            crc32: resolved.crc32,
+            offset: resolved.offset,
+        });
+        self.oid_by_offset.insert(resolved.offset, oid);
+        self.resolved_by_offset
+            .insert(resolved.offset, resolved.object.clone());
+        self.resolved_by_oid
+            .insert(resolved.object.oid, resolved.object.clone());
+        if let Some(children) = self.pending_by_offset.remove(&resolved.offset) {
+            for child in children {
+                self.resolve_delta(child.frame_index, &child.frame, &resolved.object)?;
+            }
+        }
+        if let Some(children) = self.pending_by_oid.remove(&resolved.object.oid) {
+            for child in children {
+                self.resolve_delta(child.frame_index, &child.frame, &resolved.object)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn pipeline_object_state(
+        &mut self,
+        data: &Arc<[u8]>,
+        object_type: ObjectType,
+    ) -> Result<ObjectDataState, CloneError> {
+        if object_type != ObjectType::Blob {
+            return Ok(ObjectDataState::Resident(Arc::clone(data)));
+        }
+        let resident_limit =
+            optional_usize_env("FCL_CHECKOUT_BLOB_CACHE_BYTES")?.unwrap_or(256 * 1024 * 1024);
+        let data_len = data.len();
+        let resident_limit = u64::try_from(resident_limit).unwrap_or(u64::MAX);
+        let data_len_u64 = u64::try_from(data_len).unwrap_or(u64::MAX);
+        if self.arena_spill_bytes.saturating_add(data_len_u64) <= resident_limit {
+            return Ok(ObjectDataState::Resident(Arc::clone(data)));
+        }
+        let spilled = spill_object(&self.pack_path, &self.spill_dir, data)?;
+        self.arena_spill_bytes = self.arena_spill_bytes.saturating_add(data_len_u64);
+        Ok(ObjectDataState::Spilled {
+            path: spilled.path,
+            offset: spilled.offset,
+            len: data_len as u64,
+        })
+    }
+
+    fn finish(
+        mut self,
+        checksum: [u8; 20],
+        scan_ms: u128,
+        resolve_ms: u128,
+    ) -> Result<PackIngestReport, CloneError> {
+        let pending = self.pending_by_offset.values().map(Vec::len).sum::<usize>()
+            + self.pending_by_oid.values().map(Vec::len).sum::<usize>();
+        if pending != 0 {
+            return Err(CloneError::PackIndexFailed {
+                path: self.pack_path.clone(),
+                operation: "resolving deltas",
+                detail: format!("{pending} delta objects could not find resolved bases"),
+            });
+        }
+        self.entries
+            .sort_unstable_by(|left, right| left.oid.cmp(&right.oid));
+        let idx_write_start = Instant::now();
+        write_idx_v2(&self.index_path, &self.entries, &checksum)?;
+        let idx_write_ms = idx_write_start.elapsed().as_millis();
+        let object_state_start = Instant::now();
+        let store_state = self.store.finish()?;
+        let object_state_ms = object_state_start.elapsed().as_millis();
+        let pack = PackStorage::open_file_backed(&self.pack_path)?;
+        Ok(PackIngestReport {
+            index: PackIndex {
+                pack_path: self.pack_path,
+                pack,
+                meta_by_oid: store_state.meta_by_oid,
+                oid_by_offset: self.oid_by_offset,
+                state_by_oid: store_state.state_by_oid,
+                retained_object_count: store_state.retained_object_count,
+                retained_object_bytes: store_state.retained_object_bytes,
+                spilled_object_count: store_state.spilled_object_count,
+                spilled_object_bytes: store_state.spilled_object_bytes,
+                reconstructed_object_count: Arc::new(AtomicUsize::new(0)),
+            },
+            scan_ms,
+            resolve_ms,
+            idx_write_ms,
+            object_state_ms,
+            checkout_needed_blob_count: 0,
+            checkout_ready_blob_count: 0,
+            checkout_ready_blob_bytes: 0,
+            checkout_spilled_blob_count: 0,
+            checkout_spilled_blob_bytes: 0,
+            checkout_missing_blob_count: 0,
+            pipeline_frame_count: Some(self.frame_count),
+            pipeline_checkout_wait_ms: Some(self.store.checkout_wait_ms()),
+            pipeline_peak_pending_delta_count: Some(self.peak_pending_delta_count),
+            pipeline_arena_spill_bytes: Some(self.arena_spill_bytes),
+        })
+    }
+
+    fn update_peak_pending(&mut self) {
+        let pending = self.pending_by_offset.values().map(Vec::len).sum::<usize>()
+            + self.pending_by_oid.values().map(Vec::len).sum::<usize>();
+        self.peak_pending_delta_count = self.peak_pending_delta_count.max(pending);
+    }
+}
+
+fn frame_payload_from_frame(
+    pack_path: &Path,
+    frame: &ObjectFrame,
+) -> Result<Arc<[u8]>, CloneError> {
+    frame.inflated.as_ref().map_or_else(
+        || {
+            Err(CloneError::PackIndexFailed {
+                path: pack_path.to_owned(),
+                operation: "reading pipeline frame payload",
+                detail: "streaming pipeline frame did not carry inflated payload".to_owned(),
+            })
+        },
+        |inflated| Ok(Arc::clone(inflated)),
+    )
 }
 
 fn build_object_states(
@@ -693,7 +1298,7 @@ fn build_object_states(
             checkout_ready_blob_bytes += data_len;
             ObjectDataState::Resident(frame.object.data)
         } else if is_checkout_needed_blob {
-            let path = spill_object(pack_path, spill_dir, oid, &frame.object.data)?;
+            let spilled = spill_object(pack_path, spill_dir, &frame.object.data)?;
             spilled_object_count += 1;
             spilled_object_bytes = spilled_object_bytes.saturating_add(data_len);
             checkout_spilled_blob_count += 1;
@@ -702,7 +1307,8 @@ fn build_object_states(
             checkout_ready_blob_bytes += data_len;
             enforce_max_spill_bytes(max_spill_bytes, spilled_object_bytes)?;
             ObjectDataState::Spilled {
-                path,
+                path: spilled.path,
+                offset: spilled.offset,
                 len: data_len as u64,
             }
         } else if should_keep_resident {
@@ -710,12 +1316,13 @@ fn build_object_states(
             retained_object_bytes += data_len;
             ObjectDataState::Resident(frame.object.data)
         } else if frame.object.object_type == ObjectType::Blob && spill_blobs {
-            let path = spill_object(pack_path, spill_dir, oid, &frame.object.data)?;
+            let spilled = spill_object(pack_path, spill_dir, &frame.object.data)?;
             spilled_object_count += 1;
             spilled_object_bytes = spilled_object_bytes.saturating_add(data_len);
             enforce_max_spill_bytes(max_spill_bytes, spilled_object_bytes)?;
             ObjectDataState::Spilled {
-                path,
+                path: spilled.path,
+                offset: spilled.offset,
                 len: data_len as u64,
             }
         } else {
@@ -817,24 +1424,40 @@ fn checkout_needed_blobs(
     Ok(needed_blobs)
 }
 
+#[derive(Debug, Clone)]
+struct SpilledObject {
+    path: PathBuf,
+    offset: u64,
+}
+
 fn spill_object(
     pack_path: &Path,
     spill_dir: &Path,
-    oid: ObjectId,
     data: &[u8],
-) -> Result<PathBuf, CloneError> {
+) -> Result<SpilledObject, CloneError> {
     fs::create_dir_all(spill_dir).map_err(|error| CloneError::PackIndexFailed {
         path: spill_dir.to_owned(),
         operation: "creating object spill directory",
         detail: error.to_string(),
     })?;
-    let path = spill_dir.join(oid.to_hex());
-    fs::write(&path, data).map_err(|error| CloneError::PackIndexFailed {
-        path: pack_path.to_owned(),
-        operation: "spilling object data",
-        detail: format!("{}: {error}", path.display()),
-    })?;
-    Ok(path)
+    let path = spill_dir.join("fcl-spill.dat");
+    let offset = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: path.clone(),
+            operation: "opening object spill arena",
+            detail: error.to_string(),
+        })?;
+    file.write_all(data)
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "spilling object data",
+            detail: format!("{}: {error}", path.display()),
+        })?;
+    Ok(SpilledObject { path, offset })
 }
 
 fn optional_usize_env(name: &'static str) -> Result<Option<usize>, CloneError> {
@@ -851,6 +1474,17 @@ fn optional_usize_env(name: &'static str) -> Result<Option<usize>, CloneError> {
     Ok(Some(value))
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn u64_saturating_from_u128(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ScanPayload {
     Inflate,
@@ -860,6 +1494,7 @@ pub enum ScanPayload {
 #[derive(Debug)]
 pub struct StreamingPackScanner {
     pack_path: PathBuf,
+    payload: ScanPayload,
     state: ScannerState,
     header: [u8; 12],
     header_len: usize,
@@ -895,12 +1530,18 @@ struct PartialObjectFrame {
     ref_delta_base_oid: [u8; 20],
     ref_delta_base_len: usize,
     decompressor: Decompress,
+    inflated: Vec<u8>,
 }
 
 impl StreamingPackScanner {
     pub fn new(pack_path: &Path) -> Self {
+        Self::with_payload(pack_path, ScanPayload::MetadataOnly)
+    }
+
+    pub fn with_payload(pack_path: &Path, payload: ScanPayload) -> Self {
         Self {
             pack_path: pack_path.to_owned(),
+            payload,
             state: ScannerState::PackHeader,
             header: [0; 12],
             header_len: 0,
@@ -913,16 +1554,36 @@ impl StreamingPackScanner {
     }
 
     pub fn feed(&mut self, mut bytes: &[u8]) -> Result<(), CloneError> {
+        self.feed_inner(&mut bytes, None)
+    }
+
+    pub fn feed_collect(&mut self, mut bytes: &[u8]) -> Result<Vec<ObjectFrame>, CloneError> {
+        let mut frames = Vec::new();
+        self.feed_inner(&mut bytes, Some(&mut frames))?;
+        Ok(frames)
+    }
+
+    fn feed_inner(
+        &mut self,
+        bytes: &mut &[u8],
+        mut completed: Option<&mut Vec<ObjectFrame>>,
+    ) -> Result<(), CloneError> {
         while !bytes.is_empty() {
             match self.state {
-                ScannerState::PackHeader => self.feed_pack_header(&mut bytes)?,
-                ScannerState::ObjectHeader => self.feed_object_header(&mut bytes)?,
-                ScannerState::OffsetDeltaBase => self.feed_offset_delta_base(&mut bytes)?,
-                ScannerState::RefDeltaBase => self.feed_ref_delta_base(&mut bytes)?,
-                ScannerState::CompressedPayload => self.feed_compressed_payload(&mut bytes)?,
+                ScannerState::PackHeader => self.feed_pack_header(bytes)?,
+                ScannerState::ObjectHeader => self.feed_object_header(bytes)?,
+                ScannerState::OffsetDeltaBase => self.feed_offset_delta_base(bytes)?,
+                ScannerState::RefDeltaBase => self.feed_ref_delta_base(bytes)?,
+                ScannerState::CompressedPayload => {
+                    if let Some(frame) = self.feed_compressed_payload(bytes)?
+                        && let Some(completed) = completed.as_deref_mut()
+                    {
+                        completed.push(frame);
+                    }
+                }
                 ScannerState::Trailer => {
                     self.feed_trailer(bytes)?;
-                    bytes = &[];
+                    *bytes = &[];
                 }
             }
         }
@@ -1029,6 +1690,7 @@ impl StreamingPackScanner {
                 ref_delta_base_oid: [0; 20],
                 ref_delta_base_len: 0,
                 decompressor: Decompress::new(true),
+                inflated: Vec::new(),
             });
         } else if let Some(current) = self.current.as_mut() {
             current.crc32.update(&[byte]);
@@ -1154,7 +1816,10 @@ impl StreamingPackScanner {
         Ok(())
     }
 
-    fn feed_compressed_payload(&mut self, bytes: &mut &[u8]) -> Result<(), CloneError> {
+    fn feed_compressed_payload(
+        &mut self,
+        bytes: &mut &[u8],
+    ) -> Result<Option<ObjectFrame>, CloneError> {
         let current = self
             .current
             .as_mut()
@@ -1180,6 +1845,10 @@ impl StreamingPackScanner {
             current.decompressor.total_in() - before_in,
         )?;
         let inflated = current.decompressor.total_out() - before_out;
+        let written = usize_from_u64(&self.pack_path, "tracking inflated output", inflated)?;
+        if matches!(self.payload, ScanPayload::Inflate) && written > 0 {
+            current.inflated.extend_from_slice(&output[..written]);
+        }
         if consumed > 0 {
             current.crc32.update(&bytes[..consumed]);
             current.compressed_len += consumed;
@@ -1199,8 +1868,7 @@ impl StreamingPackScanner {
                     ),
                 });
             }
-            self.finish_frame()?;
-            return Ok(());
+            return self.finish_frame().map(Some);
         }
         if consumed == 0 && inflated == 0 {
             return Err(CloneError::PackIndexFailed {
@@ -1209,10 +1877,10 @@ impl StreamingPackScanner {
                 detail: "decompressor made no progress".to_owned(),
             });
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn finish_frame(&mut self) -> Result<(), CloneError> {
+    fn finish_frame(&mut self) -> Result<ObjectFrame, CloneError> {
         let current = self
             .current
             .take()
@@ -1226,15 +1894,21 @@ impl StreamingPackScanner {
             operation: "scanning object frame",
             detail: "object encoding state was missing".to_owned(),
         })?;
-        self.frames.push(ObjectFrame {
+        let inflated = if matches!(self.payload, ScanPayload::Inflate) {
+            Some(Arc::from(current.inflated))
+        } else {
+            None
+        };
+        let frame = ObjectFrame {
             offset: current.object_start as u64,
             compressed_start: current.compressed_start,
             compressed_len: current.compressed_len,
             crc32: current.crc32.finalize(),
             encoded,
-            inflated: None,
+            inflated,
             declared_size: current.declared_size,
-        });
+        };
+        self.frames.push(frame.clone());
         let declared_objects =
             self.declared_objects
                 .ok_or_else(|| CloneError::PackIndexFailed {
@@ -1247,7 +1921,7 @@ impl StreamingPackScanner {
         } else {
             ScannerState::ObjectHeader
         };
-        Ok(())
+        Ok(frame)
     }
 
     fn feed_trailer(&mut self, bytes: &[u8]) -> Result<(), CloneError> {
@@ -1276,6 +1950,7 @@ fn scan_pack(pack_path: &Path, pack: &[u8], payload: ScanPayload) -> Result<Pack
     scan_pack_with_checksum(pack_path, pack, payload, checksum)
 }
 
+#[cfg(test)]
 fn scan_pack_with_checksum(
     pack_path: &Path,
     pack: &[u8],
@@ -1388,6 +2063,35 @@ fn scan_pack_with_checksum(
     Ok(PackScan { checksum, frames })
 }
 
+fn scan_pack_file_windowed(
+    pack_path: &Path,
+    payload: ScanPayload,
+    checksum: [u8; 20],
+) -> Result<PackScan, CloneError> {
+    let mut file = File::open(pack_path).map_err(|error| CloneError::PackIndexFailed {
+        path: pack_path.to_owned(),
+        operation: "opening pack file for windowed scan",
+        detail: error.to_string(),
+    })?;
+    let mut scanner = StreamingPackScanner::with_payload(pack_path, payload);
+    let mut buffer = vec![0u8; env_usize("FCL_SCAN_BUFFER", 1024 * 1024)];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| CloneError::PackIndexFailed {
+                path: pack_path.to_owned(),
+                operation: "reading pack file for windowed scan",
+                detail: error.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        scanner.feed(&buffer[..read])?;
+    }
+    scanner.finish(checksum)
+}
+
+#[cfg(test)]
 #[cfg(test)]
 fn validate_pack(pack_path: &Path, pack: &[u8]) -> Result<[u8; 20], CloneError> {
     validate_pack_header(pack_path, pack)?;
@@ -1405,6 +2109,7 @@ fn validate_pack(pack_path: &Path, pack: &[u8]) -> Result<[u8; 20], CloneError> 
     Ok(checksum)
 }
 
+#[cfg(test)]
 fn validate_pack_header(pack_path: &Path, pack: &[u8]) -> Result<(), CloneError> {
     if pack.len() < 32 || &pack[0..4] != b"PACK" {
         return Err(CloneError::PackIndexFailed {
@@ -1416,6 +2121,7 @@ fn validate_pack_header(pack_path: &Path, pack: &[u8]) -> Result<(), CloneError>
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_object_header(
     pack_path: &Path,
     pack: &[u8],
@@ -1448,6 +2154,7 @@ fn parse_object_header(
     Ok((kind, size, offset))
 }
 
+#[cfg(test)]
 fn parse_offset_delta_base(
     pack_path: &Path,
     pack: &[u8],
@@ -1485,6 +2192,7 @@ fn parse_offset_delta_base(
     Ok((base_offset, offset))
 }
 
+#[cfg(test)]
 fn inflate_next_frame(
     pack_path: &Path,
     pack: &[u8],
@@ -1744,6 +2452,7 @@ fn frame_payload(
     )
 }
 
+#[cfg(test)]
 fn scan_zlib_stream_len(pack_path: &Path, pack: &[u8], offset: usize) -> Result<usize, CloneError> {
     let mut decompressor = Decompress::new(true);
     let mut output = [0u8; 8192];
@@ -2550,6 +3259,94 @@ mod tests {
         fs::remove_dir_all(temp).expect("test temp directory should be removed");
     }
 
+    #[test]
+    fn streaming_scanner_should_emit_completed_frames() {
+        let temp = test_temp_dir("streaming-frame-events");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let checksum = validate_pack(&pack_path, &pack).expect("pack checksum should validate");
+        let expected = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+        let mut scanner = super::StreamingPackScanner::new(&pack_path);
+        let mut emitted = Vec::new();
+
+        for chunk in pack.chunks(31) {
+            emitted.extend(
+                scanner
+                    .feed_collect(chunk)
+                    .expect("streaming scanner should accept chunk"),
+            );
+        }
+        let finished = scanner
+            .finish(checksum)
+            .expect("streaming scanner should finish");
+
+        assert_eq!(emitted.len(), expected.frames.len());
+        assert_same_scan_metadata(&finished, &expected, 31);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn windowed_scan_should_match_in_memory_scan() {
+        let temp = test_temp_dir("windowed-scan");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let checksum = validate_pack(&pack_path, &pack).expect("pack checksum should validate");
+        let expected = scan_pack(&pack_path, &pack, ScanPayload::MetadataOnly)
+            .expect("metadata scan should work");
+
+        let actual =
+            super::scan_pack_file_windowed(&pack_path, ScanPayload::MetadataOnly, checksum)
+                .expect("windowed scan should work");
+
+        assert_same_scan_metadata(&actual, &expected, 0);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn pipeline_resolver_should_match_sequential_index_metadata() {
+        let temp = test_temp_dir("pipeline-resolver");
+        let repo = build_packed_test_repo(&temp);
+        let pack_path = only_pack_path(&repo);
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let scan =
+            scan_pack(&pack_path, &pack, ScanPayload::Inflate).expect("inflated scan should work");
+        let sequential = ingest_scanned_pack(
+            &pack_path,
+            &temp.join("sequential.idx"),
+            PackStorage::open_file_backed(&pack_path).expect("file-backed storage should open"),
+            &scan,
+            0,
+            PackIngestOptions::default(),
+        )
+        .expect("sequential ingest should work");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(scan.frames.len() + 1);
+        let store = super::PipelineObjectStore::new(&pack_path);
+
+        for frame in scan.frames.clone() {
+            sender
+                .send(super::PipelineEvent::Frame(frame))
+                .expect("frame should send");
+        }
+        sender
+            .send(super::PipelineEvent::Finished {
+                checksum: scan.checksum,
+                pack_bytes: pack.len() as u64,
+                scan_ms: 0,
+            })
+            .expect("finish should send");
+        drop(sender);
+
+        let pipeline =
+            super::ingest_pack_pipeline(&pack_path, &temp.join("pipeline.idx"), receiver, store)
+                .expect("pipeline ingest should work");
+
+        assert_same_pack_metadata(&pipeline.index, &sequential.index);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
     fn test_temp_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2664,6 +3461,25 @@ mod tests {
         assert_eq!(left.retained_object_bytes, right.retained_object_bytes);
         assert_eq!(left.spilled_object_count, right.spilled_object_count);
         assert_eq!(left.spilled_object_bytes, right.spilled_object_bytes);
+        for (oid, left_meta) in &left.meta_by_oid {
+            let right_meta = right
+                .meta_by_oid
+                .get(oid)
+                .expect("right index should contain oid");
+            assert_eq!(left_meta.object_type, right_meta.object_type);
+            assert_eq!(left_meta.size, right_meta.size);
+            assert_eq!(left_meta.pack_inflated_size, right_meta.pack_inflated_size);
+            assert_eq!(left_meta.pack_offset, right_meta.pack_offset);
+            assert_eq!(left_meta.compressed_start, right_meta.compressed_start);
+            assert_eq!(left_meta.compressed_len, right_meta.compressed_len);
+            assert_eq!(left_meta.crc32, right_meta.crc32);
+            assert_eq!(left_meta.delta_base, right_meta.delta_base);
+        }
+    }
+
+    fn assert_same_pack_metadata(left: &PackIndex, right: &PackIndex) {
+        assert_eq!(left.meta_by_oid.len(), right.meta_by_oid.len());
+        assert_eq!(left.oid_by_offset, right.oid_by_offset);
         for (oid, left_meta) in &left.meta_by_oid {
             let right_meta = right
                 .meta_by_oid

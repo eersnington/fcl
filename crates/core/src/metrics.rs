@@ -32,6 +32,11 @@ pub struct CloneReport {
     pub checkout_spilled_blob_bytes: usize,
     pub checkout_missing_blob_count: usize,
     pub reconstructed_object_count: usize,
+    pub pipeline_enabled: bool,
+    pub pipeline_frame_count: Option<usize>,
+    pub pipeline_checkout_wait_ms: Option<u128>,
+    pub pipeline_peak_pending_delta_count: Option<usize>,
+    pub pipeline_arena_spill_bytes: Option<u64>,
     pub target_bytes: u64,
     pub rss_bytes: Option<u64>,
 }

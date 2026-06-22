@@ -102,6 +102,15 @@ fn main() {
                 report.checkout_spilled_blob_bytes,
                 report.checkout_missing_blob_count
             );
+            if report.pipeline_enabled {
+                eprintln!(
+                    "fcl: pipeline frames={} checkout_wait={}ms peak_pending_deltas={} arena_spill_bytes={}",
+                    report.pipeline_frame_count.unwrap_or_default(),
+                    report.pipeline_checkout_wait_ms.unwrap_or_default(),
+                    report.pipeline_peak_pending_delta_count.unwrap_or_default(),
+                    report.pipeline_arena_spill_bytes.unwrap_or_default()
+                );
+            }
             eprintln!("fcl: target uses {} bytes", report.target_bytes);
             if let Some(rss_bytes) = report.rss_bytes {
                 eprintln!("fcl: rss {rss_bytes} bytes");

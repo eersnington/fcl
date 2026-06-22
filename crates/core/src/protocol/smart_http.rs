@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -9,7 +10,7 @@ use sha1::{Digest, Sha1};
 use url::Url;
 
 use crate::error::CloneError;
-use crate::pack::{PackScan, StreamingPackScanner};
+use crate::pack::{PackScan, PipelineEvent, ScanPayload, StreamingPackScanner};
 use crate::protocol::pkt_line::{
     Packet, encode_data, encode_delimiter, encode_flush, parse_packets,
 };
@@ -115,22 +116,7 @@ pub fn fetch_full_pack(
     refs: &[RemoteRef],
     pack_path: &Path,
 ) -> Result<FetchedPack, CloneError> {
-    let mut body = Vec::new();
-    encode_data("command=fetch\n", &mut body);
-    encode_data("agent=fcl/0.1\n", &mut body);
-    encode_delimiter(&mut body);
-    if env_bool("FCL_NO_PROGRESS") {
-        encode_data("no-progress\n", &mut body);
-    }
-    encode_data("thin-pack\n", &mut body);
-    encode_data("ofs-delta\n", &mut body);
-
-    for oid in unique_oids(refs) {
-        encode_data(&format!("want {oid}\n"), &mut body);
-    }
-
-    encode_data("done\n", &mut body);
-    encode_flush(&mut body);
+    let body = fetch_body(refs);
 
     let mut response = with_retries(|| {
         client
@@ -167,6 +153,72 @@ pub fn fetch_full_pack(
         source,
     })?;
     Ok(fetched_pack)
+}
+
+pub fn fetch_full_pack_pipelined(
+    client: &Client,
+    remote: &Remote,
+    refs: &[RemoteRef],
+    pack_path: &Path,
+    sender: &SyncSender<PipelineEvent>,
+) -> Result<FetchedPack, CloneError> {
+    let body = fetch_body(refs);
+    let mut response = with_retries(|| {
+        client
+            .post(&remote.upload_pack_url)
+            .headers(upload_pack_headers())
+            .body(body.clone())
+            .send()
+            .map_err(|error| CloneError::RemoteDiscoveryFailed {
+                url: remote.url.clone(),
+                operation: "fetching full pack",
+                detail: error.to_string(),
+            })
+    })?;
+
+    if !response.status().is_success() {
+        return Err(CloneError::RemoteDiscoveryFailed {
+            url: remote.url.clone(),
+            operation: "fetching full pack",
+            detail: format!("server returned HTTP {}", response.status()),
+        });
+    }
+
+    let file = File::create(pack_path).map_err(|source| CloneError::PackWriteFailed {
+        path: pack_path.to_owned(),
+        source,
+    })?;
+    let mut file = BufWriter::with_capacity(
+        env_usize("FCL_PACK_WRITE_BUFFER", DEFAULT_PACK_WRITE_BUFFER),
+        file,
+    );
+    let fetched_pack =
+        write_sideband_pack_pipelined(&remote.url, pack_path, &mut response, &mut file, sender)?;
+    file.flush().map_err(|source| CloneError::PackWriteFailed {
+        path: pack_path.to_owned(),
+        source,
+    })?;
+    Ok(fetched_pack)
+}
+
+fn fetch_body(refs: &[RemoteRef]) -> Vec<u8> {
+    let mut body = Vec::new();
+    encode_data("command=fetch\n", &mut body);
+    encode_data("agent=fcl/0.1\n", &mut body);
+    encode_delimiter(&mut body);
+    if env_bool("FCL_NO_PROGRESS") {
+        encode_data("no-progress\n", &mut body);
+    }
+    encode_data("thin-pack\n", &mut body);
+    encode_data("ofs-delta\n", &mut body);
+
+    for oid in unique_oids(refs) {
+        encode_data(&format!("want {oid}\n"), &mut body);
+    }
+
+    encode_data("done\n", &mut body);
+    encode_flush(&mut body);
+    body
 }
 
 fn parse_https_url(raw_url: &str) -> Result<Url, CloneError> {
@@ -398,6 +450,94 @@ fn write_sideband_pack(
         checksum,
         scan,
         scan_ms: scan_duration.as_millis(),
+    })
+}
+
+fn write_sideband_pack_pipelined(
+    raw_url: &str,
+    pack_path: &Path,
+    response: &mut impl Read,
+    file: &mut impl Write,
+    sender: &SyncSender<PipelineEvent>,
+) -> Result<FetchedPack, CloneError> {
+    let mut pack_bytes = 0u64;
+    let mut hasher = PackTrailerHasher::new();
+    let max_pack_bytes = optional_u64_env("FCL_MAX_PACK_BYTES")?;
+    let mut scanner = StreamingPackScanner::with_payload(pack_path, ScanPayload::Inflate);
+    let mut scan_duration = Duration::ZERO;
+
+    loop {
+        let packet = read_packet(raw_url, response)?;
+        let Some(data) = packet else {
+            break;
+        };
+        if data == b"packfile\n" || data == b"shallow-info\n" || data == b"acknowledgments\n" {
+            continue;
+        }
+        let Some((band, payload)) = data.split_first() else {
+            continue;
+        };
+        match *band {
+            1 => {
+                file.write_all(payload)
+                    .map_err(|source| CloneError::PackWriteFailed {
+                        path: pack_path.to_owned(),
+                        source,
+                    })?;
+                pack_bytes += payload.len() as u64;
+                enforce_max_pack_bytes(max_pack_bytes, pack_bytes)?;
+                hasher.update(payload);
+                let scan_start = Instant::now();
+                let frames = scanner.feed_collect(payload)?;
+                scan_duration += scan_start.elapsed();
+                for frame in frames {
+                    sender.send(PipelineEvent::Frame(frame)).map_err(|error| {
+                        CloneError::PackIndexFailed {
+                            path: pack_path.to_owned(),
+                            operation: "sending pipeline object frame",
+                            detail: error.to_string(),
+                        }
+                    })?;
+                }
+            }
+            2 => {}
+            3 => {
+                return Err(CloneError::RemoteDiscoveryFailed {
+                    url: raw_url.to_owned(),
+                    operation: "fetching full pack",
+                    detail: String::from_utf8_lossy(payload).trim().to_owned(),
+                });
+            }
+            other => {
+                return Err(CloneError::MalformedRemoteResponse {
+                    url: raw_url.to_owned(),
+                    operation: "parsing pack sideband response",
+                    detail: format!("unknown sideband channel {other}"),
+                });
+            }
+        }
+    }
+
+    let checksum = validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    scanner.finish(checksum)?;
+    let scan_ms = scan_duration.as_millis();
+    sender
+        .send(PipelineEvent::Finished {
+            checksum,
+            pack_bytes,
+            scan_ms,
+        })
+        .map_err(|error| CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "sending pipeline completion",
+            detail: error.to_string(),
+        })?;
+
+    Ok(FetchedPack {
+        bytes: pack_bytes,
+        checksum,
+        scan: None,
+        scan_ms,
     })
 }
 

@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::sync_channel;
+use std::thread;
 use std::time::Instant;
 
 use url::Url;
@@ -8,11 +10,11 @@ use crate::checkout::materialize_default_branch;
 use crate::error::CloneError;
 use crate::metrics::{CloneReport, measure_ms};
 use crate::pack::{
-    CheckoutHint, ObjectId, PackIngestOptions, PackStorage, ingest_fetched_pack,
-    ingest_scanned_pack,
+    CheckoutHint, ObjectId, PackIngestOptions, PackStorage, PipelineObjectStore,
+    ingest_fetched_pack, ingest_pack_pipeline, ingest_scanned_pack,
 };
-use crate::protocol::{discover_remote, fetch_full_pack, http_client};
-use crate::repo::RepoLayout;
+use crate::protocol::{discover_remote, fetch_full_pack, fetch_full_pack_pipelined, http_client};
+use crate::repo::{FinalizingRepo, RepoLayout};
 
 #[derive(Debug)]
 pub struct CloneRequest {
@@ -26,11 +28,19 @@ impl CloneRequest {
     }
 }
 
+pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
+    if env_bool("FCL_PIPELINE") {
+        clone_repo_pipelined(request)
+    } else {
+        clone_repo_sequential(request)
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "top-level clone orchestration keeps phase timing and report assembly together"
 )]
-pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
+fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let start = Instant::now();
     let client = http_client()?;
     let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
@@ -44,7 +54,8 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         Some(target) => target,
         None => default_target_dir(&request.url)?,
     };
-    let repo = RepoLayout::create(&target)?;
+    let staged_repo = FinalizingRepo::create(&target)?;
+    let repo = staged_repo.layout()?;
     let max_temp_bytes = optional_u64_env("FCL_MAX_TEMP_BYTES")?;
 
     let (fetched_pack, fetch_ms) =
@@ -57,7 +68,7 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         pack_bytes,
         "checking fetched pack size",
     )?;
-    enforce_target_size_limit(max_temp_bytes, &repo, "checking target size after fetch")?;
+    enforce_target_size_limit(max_temp_bytes, repo, "checking target size after fetch")?;
     let streaming_pack_scan = fetched_pack.scan.is_some();
     let ingest_options = PackIngestOptions {
         checkout_hint: Some(CheckoutHint { default_commit }),
@@ -99,12 +110,13 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     let checkout_spilled_blob_bytes = ingest_report.checkout_spilled_blob_bytes;
     let checkout_missing_blob_count = ingest_report.checkout_missing_blob_count;
     repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
-    enforce_target_size_limit(max_temp_bytes, &repo, "checking target size after ingest")?;
+    enforce_target_size_limit(max_temp_bytes, repo, "checking target size after ingest")?;
     let (checkout, checkout_ms) =
-        measure_ms(|| materialize_default_branch(&repo, &pack_index, default_commit));
+        measure_ms(|| materialize_default_branch(repo, &pack_index, default_commit));
     let checkout = checkout?;
     let reconstructed_object_count = pack_index.reconstructed_object_count();
     let total_ms = start.elapsed().as_millis();
+    let repo = staged_repo.commit()?;
     let target_bytes = directory_bytes(repo.root())?;
     let rss_bytes = rss_bytes();
     enforce_optional_max_bytes(
@@ -145,9 +157,176 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         checkout_spilled_blob_bytes,
         checkout_missing_blob_count,
         reconstructed_object_count,
+        pipeline_enabled: false,
+        pipeline_frame_count: None,
+        pipeline_checkout_wait_ms: None,
+        pipeline_peak_pending_delta_count: None,
+        pipeline_arena_spill_bytes: None,
         target_bytes,
         rss_bytes,
     })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level pipeline orchestration keeps thread joins, timings, and report assembly together"
+)]
+fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError> {
+    let start = Instant::now();
+    let client = http_client()?;
+    let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
+    let remote = remote?;
+    let refs = remote.refs.select_full_clone_universe();
+    let ref_count = refs.len();
+    let default_branch = resolve_default_branch(remote.refs.default_branch.as_deref(), &refs)?;
+    let default_commit = ObjectId::parse_hex(&default_branch.oid)?;
+
+    let target = match request.target {
+        Some(target) => target,
+        None => default_target_dir(&request.url)?,
+    };
+    let staged_repo = FinalizingRepo::create(&target)?;
+    let repo = staged_repo.layout()?;
+    let max_temp_bytes = optional_u64_env("FCL_MAX_TEMP_BYTES")?;
+    repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
+
+    let pack_path = repo.pack_temp_path();
+    let index_path = repo.pack_index_temp_path();
+    let (sender, receiver) = sync_channel(pipeline_queue_capacity());
+    let store = PipelineObjectStore::new(&pack_path);
+
+    let fetch_client = client;
+    let fetch_remote = remote.clone();
+    let fetch_refs = refs.clone();
+    let fetch_pack_path = pack_path.clone();
+    let fetch_thread = thread::spawn(move || {
+        let fetch_start = Instant::now();
+        fetch_full_pack_pipelined(
+            &fetch_client,
+            &fetch_remote,
+            &fetch_refs,
+            &fetch_pack_path,
+            &sender,
+        )
+        .map(|fetched_pack| (fetched_pack, fetch_start.elapsed().as_millis()))
+    });
+
+    let resolver_store = store.clone();
+    let resolver_pack_path = pack_path.clone();
+    let resolver_index_path = index_path;
+    let resolver_thread = thread::spawn(move || {
+        let result = ingest_pack_pipeline(
+            &resolver_pack_path,
+            &resolver_index_path,
+            receiver,
+            resolver_store.clone(),
+        );
+        if let Err(error) = &result {
+            resolver_store.fail("resolving pipeline pack", error.to_string());
+        }
+        result
+    });
+
+    let checkout_start = Instant::now();
+    let checkout_result = materialize_default_branch(repo, &store, default_commit);
+    let checkout_ms = checkout_start.elapsed().as_millis();
+
+    let fetch_joined = fetch_thread
+        .join()
+        .map_err(|_| CloneError::RemoteDiscoveryFailed {
+            url: remote.url.clone(),
+            operation: "joining pipeline fetch thread",
+            detail: "fetch thread panicked".to_owned(),
+        })?;
+    let (fetched_pack, fetch_ms) = fetch_joined?;
+    let pack_bytes = fetched_pack.bytes;
+    enforce_optional_max_bytes(
+        "FCL_MAX_PACK_BYTES",
+        optional_u64_env("FCL_MAX_PACK_BYTES")?,
+        pack_bytes,
+        "checking fetched pack size",
+    )?;
+
+    let ingest_report = resolver_thread
+        .join()
+        .map_err(|_| CloneError::PackIndexFailed {
+            path: pack_path.clone(),
+            operation: "joining pipeline resolver thread",
+            detail: "resolver thread panicked".to_owned(),
+        })??;
+    let checkout = checkout_result?;
+    let pack_index = ingest_report.index;
+    enforce_target_size_limit(
+        max_temp_bytes,
+        repo,
+        "checking target size after pipeline clone",
+    )?;
+    let reconstructed_object_count = pack_index.reconstructed_object_count();
+    let total_ms = start.elapsed().as_millis();
+    let repo = staged_repo.commit()?;
+    let target_bytes = directory_bytes(repo.root())?;
+    let rss_bytes = rss_bytes();
+    enforce_optional_max_bytes(
+        "FCL_MAX_TEMP_BYTES",
+        max_temp_bytes,
+        target_bytes,
+        "checking final target size",
+    )?;
+
+    Ok(CloneReport {
+        ref_count,
+        pack_bytes,
+        total_ms,
+        discovery_ms,
+        fetch_ms,
+        ingest_ms: ingest_report.resolve_ms
+            + ingest_report.idx_write_ms
+            + ingest_report.object_state_ms,
+        pack_scan_ms: ingest_report.scan_ms,
+        pack_resolve_ms: ingest_report.resolve_ms,
+        pack_idx_write_ms: ingest_report.idx_write_ms,
+        pack_object_state_ms: ingest_report.object_state_ms,
+        streaming_pack_scan: true,
+        checkout_ms,
+        checkout_manifest_ms: checkout.manifest_ms,
+        checkout_dir_create_ms: checkout.dir_create_ms,
+        checkout_file_materialize_ms: checkout.file_materialize_ms,
+        checkout_index_write_ms: checkout.index_write_ms,
+        checkout_file_count: checkout.file_count,
+        checkout_dir_count: checkout.dir_count,
+        checkout_blob_bytes: checkout.blob_bytes,
+        retained_object_count: pack_index.retained_object_count(),
+        retained_object_bytes: pack_index.retained_object_bytes(),
+        spilled_object_count: pack_index.spilled_object_count(),
+        spilled_object_bytes: pack_index.spilled_object_bytes(),
+        checkout_needed_blob_count: ingest_report.checkout_needed_blob_count,
+        checkout_ready_blob_count: ingest_report.checkout_ready_blob_count,
+        checkout_ready_blob_bytes: ingest_report.checkout_ready_blob_bytes,
+        checkout_spilled_blob_count: ingest_report.checkout_spilled_blob_count,
+        checkout_spilled_blob_bytes: ingest_report.checkout_spilled_blob_bytes,
+        checkout_missing_blob_count: ingest_report.checkout_missing_blob_count,
+        reconstructed_object_count,
+        pipeline_enabled: true,
+        pipeline_frame_count: ingest_report.pipeline_frame_count,
+        pipeline_checkout_wait_ms: ingest_report.pipeline_checkout_wait_ms,
+        pipeline_peak_pending_delta_count: ingest_report.pipeline_peak_pending_delta_count,
+        pipeline_arena_spill_bytes: ingest_report.pipeline_arena_spill_bytes,
+        target_bytes,
+        rss_bytes,
+    })
+}
+
+fn pipeline_queue_capacity() -> usize {
+    std::env::var("FCL_PIPELINE_FRAME_QUEUE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024)
+}
+
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 fn enforce_target_size_limit(
