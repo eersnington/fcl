@@ -16,6 +16,7 @@ use crate::protocol::pkt_line::{
 };
 
 const DEFAULT_PACK_WRITE_BUFFER: usize = 1024 * 1024;
+const PACK_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RemoteRef {
@@ -115,54 +116,10 @@ pub fn fetch_full_pack(
     remote: &Remote,
     refs: &[RemoteRef],
     pack_path: &Path,
+    progress: Option<&dyn Fn(u64)>,
 ) -> Result<FetchedPack, CloneError> {
     let body = fetch_body(refs);
 
-    let mut response = with_retries(|| {
-        client
-            .post(&remote.upload_pack_url)
-            .headers(upload_pack_headers())
-            .body(body.clone())
-            .send()
-            .map_err(|error| CloneError::RemoteDiscoveryFailed {
-                url: remote.url.clone(),
-                operation: "fetching full pack",
-                detail: error.to_string(),
-            })
-    })?;
-
-    if !response.status().is_success() {
-        return Err(CloneError::RemoteDiscoveryFailed {
-            url: remote.url.clone(),
-            operation: "fetching full pack",
-            detail: format!("server returned HTTP {}", response.status()),
-        });
-    }
-
-    let file = File::create(pack_path).map_err(|source| CloneError::PackWriteFailed {
-        path: pack_path.to_owned(),
-        source,
-    })?;
-    let mut file = BufWriter::with_capacity(
-        env_usize("FCL_PACK_WRITE_BUFFER", DEFAULT_PACK_WRITE_BUFFER),
-        file,
-    );
-    let fetched_pack = write_sideband_pack(&remote.url, pack_path, &mut response, &mut file)?;
-    file.flush().map_err(|source| CloneError::PackWriteFailed {
-        path: pack_path.to_owned(),
-        source,
-    })?;
-    Ok(fetched_pack)
-}
-
-pub fn fetch_full_pack_pipelined(
-    client: &Client,
-    remote: &Remote,
-    refs: &[RemoteRef],
-    pack_path: &Path,
-    sender: &SyncSender<PipelineEvent>,
-) -> Result<FetchedPack, CloneError> {
-    let body = fetch_body(refs);
     let mut response = with_retries(|| {
         client
             .post(&remote.upload_pack_url)
@@ -193,7 +150,60 @@ pub fn fetch_full_pack_pipelined(
         file,
     );
     let fetched_pack =
-        write_sideband_pack_pipelined(&remote.url, pack_path, &mut response, &mut file, sender)?;
+        write_sideband_pack(&remote.url, pack_path, &mut response, &mut file, progress)?;
+    file.flush().map_err(|source| CloneError::PackWriteFailed {
+        path: pack_path.to_owned(),
+        source,
+    })?;
+    Ok(fetched_pack)
+}
+
+pub fn fetch_full_pack_pipelined(
+    client: &Client,
+    remote: &Remote,
+    refs: &[RemoteRef],
+    pack_path: &Path,
+    sender: &SyncSender<PipelineEvent>,
+    progress: Option<&dyn Fn(u64)>,
+) -> Result<FetchedPack, CloneError> {
+    let body = fetch_body(refs);
+    let mut response = with_retries(|| {
+        client
+            .post(&remote.upload_pack_url)
+            .headers(upload_pack_headers())
+            .body(body.clone())
+            .send()
+            .map_err(|error| CloneError::RemoteDiscoveryFailed {
+                url: remote.url.clone(),
+                operation: "fetching full pack",
+                detail: error.to_string(),
+            })
+    })?;
+
+    if !response.status().is_success() {
+        return Err(CloneError::RemoteDiscoveryFailed {
+            url: remote.url.clone(),
+            operation: "fetching full pack",
+            detail: format!("server returned HTTP {}", response.status()),
+        });
+    }
+
+    let file = File::create(pack_path).map_err(|source| CloneError::PackWriteFailed {
+        path: pack_path.to_owned(),
+        source,
+    })?;
+    let mut file = BufWriter::with_capacity(
+        env_usize("FCL_PACK_WRITE_BUFFER", DEFAULT_PACK_WRITE_BUFFER),
+        file,
+    );
+    let fetched_pack = write_sideband_pack_pipelined(
+        &remote.url,
+        pack_path,
+        &mut response,
+        &mut file,
+        sender,
+        progress,
+    )?;
     file.flush().map_err(|source| CloneError::PackWriteFailed {
         path: pack_path.to_owned(),
         source,
@@ -388,8 +398,10 @@ fn write_sideband_pack(
     pack_path: &Path,
     response: &mut impl Read,
     file: &mut impl Write,
+    progress: Option<&dyn Fn(u64)>,
 ) -> Result<FetchedPack, CloneError> {
     let mut pack_bytes = 0u64;
+    let mut next_progress_bytes = 0u64;
     let mut hasher = PackTrailerHasher::new();
     let max_pack_bytes = optional_u64_env("FCL_MAX_PACK_BYTES")?;
     let mut scanner = env_bool("FCL_STREAM_SCAN").then(|| StreamingPackScanner::new(pack_path));
@@ -414,6 +426,7 @@ fn write_sideband_pack(
                         source,
                     })?;
                 pack_bytes += payload.len() as u64;
+                emit_pack_progress(progress, pack_bytes, &mut next_progress_bytes);
                 enforce_max_pack_bytes(max_pack_bytes, pack_bytes)?;
                 hasher.update(payload);
                 if let Some(scanner) = scanner.as_mut() {
@@ -441,6 +454,9 @@ fn write_sideband_pack(
     }
 
     let checksum = validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    if let Some(progress) = progress {
+        progress(pack_bytes);
+    }
     let scan = scanner
         .map(|scanner| scanner.finish(checksum))
         .transpose()?;
@@ -459,8 +475,10 @@ fn write_sideband_pack_pipelined(
     response: &mut impl Read,
     file: &mut impl Write,
     sender: &SyncSender<PipelineEvent>,
+    progress: Option<&dyn Fn(u64)>,
 ) -> Result<FetchedPack, CloneError> {
     let mut pack_bytes = 0u64;
+    let mut next_progress_bytes = 0u64;
     let mut hasher = PackTrailerHasher::new();
     let max_pack_bytes = optional_u64_env("FCL_MAX_PACK_BYTES")?;
     let mut scanner = StreamingPackScanner::with_payload(pack_path, ScanPayload::Inflate);
@@ -485,6 +503,7 @@ fn write_sideband_pack_pipelined(
                         source,
                     })?;
                 pack_bytes += payload.len() as u64;
+                emit_pack_progress(progress, pack_bytes, &mut next_progress_bytes);
                 enforce_max_pack_bytes(max_pack_bytes, pack_bytes)?;
                 hasher.update(payload);
                 let scan_start = Instant::now();
@@ -519,6 +538,9 @@ fn write_sideband_pack_pipelined(
     }
 
     let checksum = validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    if let Some(progress) = progress {
+        progress(pack_bytes);
+    }
     scanner.finish(checksum)?;
     let scan_ms = scan_duration.as_millis();
     sender
@@ -539,6 +561,19 @@ fn write_sideband_pack_pipelined(
         scan: None,
         scan_ms,
     })
+}
+
+fn emit_pack_progress(
+    progress: Option<&dyn Fn(u64)>,
+    pack_bytes: u64,
+    next_progress_bytes: &mut u64,
+) {
+    if let Some(progress) = progress
+        && pack_bytes >= *next_progress_bytes
+    {
+        progress(pack_bytes);
+        *next_progress_bytes = pack_bytes.saturating_add(PACK_PROGRESS_STEP_BYTES);
+    }
 }
 
 fn read_packet(raw_url: &str, reader: &mut impl Read) -> Result<Option<Vec<u8>>, CloneError> {

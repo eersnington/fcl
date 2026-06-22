@@ -19,6 +19,27 @@ impl LocalCloneRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalCloneProgressPhase {
+    InspectingSource,
+    CopyingFiles,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalCloneProgressEvent {
+    Started,
+    PhaseStarted(LocalCloneProgressPhase),
+    PhaseCompleted(LocalCloneProgressPhase),
+    CopyProgress {
+        files: usize,
+        dirs: usize,
+        symlinks: usize,
+        bytes: u64,
+    },
+    Completed,
+}
+
 #[derive(Debug)]
 pub struct LocalCloneReport {
     pub strategy: &'static str,
@@ -37,8 +58,33 @@ struct CopyStats {
     bytes: u64,
 }
 
+#[derive(Debug, Default)]
+struct CopyProgressThrottle {
+    next_entries: usize,
+    next_bytes: u64,
+}
+
 pub fn local_clone(request: LocalCloneRequest) -> Result<LocalCloneReport, CloneError> {
+    local_clone_inner(request, None)
+}
+
+pub fn local_clone_with_progress(
+    request: LocalCloneRequest,
+    progress: impl Fn(LocalCloneProgressEvent),
+) -> Result<LocalCloneReport, CloneError> {
+    local_clone_inner(request, Some(&progress))
+}
+
+fn local_clone_inner(
+    request: LocalCloneRequest,
+    progress: Option<&dyn Fn(LocalCloneProgressEvent)>,
+) -> Result<LocalCloneReport, CloneError> {
     let start = Instant::now();
+    emit_progress(progress, LocalCloneProgressEvent::Started);
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::PhaseStarted(LocalCloneProgressPhase::InspectingSource),
+    );
     let source = request
         .source
         .canonicalize()
@@ -53,6 +99,10 @@ pub fn local_clone(request: LocalCloneRequest) -> Result<LocalCloneReport, Clone
         return Err(CloneError::TargetAlreadyExists { path: target });
     }
     ensure_same_device(&source, target.parent().unwrap_or_else(|| Path::new(".")))?;
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::PhaseCompleted(LocalCloneProgressPhase::InspectingSource),
+    );
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     return Err(CloneError::LocalCloneFailed {
         path: source,
@@ -64,7 +114,32 @@ pub fn local_clone(request: LocalCloneRequest) -> Result<LocalCloneReport, Clone
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let strategy = cow_strategy();
     let mut stats = CopyStats::default();
-    copy_tree_cow(&source, &target, &mut stats)?;
+    let mut progress_throttle = CopyProgressThrottle::default();
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::PhaseStarted(LocalCloneProgressPhase::CopyingFiles),
+    );
+    copy_tree_cow(
+        &source,
+        &target,
+        &mut stats,
+        progress,
+        &mut progress_throttle,
+    )?;
+    emit_copy_progress(progress, &stats);
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::PhaseCompleted(LocalCloneProgressPhase::CopyingFiles),
+    );
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::PhaseStarted(LocalCloneProgressPhase::Finalizing),
+    );
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::PhaseCompleted(LocalCloneProgressPhase::Finalizing),
+    );
+    emit_progress(progress, LocalCloneProgressEvent::Completed);
     Ok(LocalCloneReport {
         strategy,
         total_ms: start.elapsed().as_millis(),
@@ -73,6 +148,43 @@ pub fn local_clone(request: LocalCloneRequest) -> Result<LocalCloneReport, Clone
         symlink_count: stats.symlink_count,
         bytes: stats.bytes,
     })
+}
+
+fn emit_progress(
+    progress: Option<&dyn Fn(LocalCloneProgressEvent)>,
+    event: LocalCloneProgressEvent,
+) {
+    if let Some(progress) = progress {
+        progress(event);
+    }
+}
+
+fn emit_copy_progress(progress: Option<&dyn Fn(LocalCloneProgressEvent)>, stats: &CopyStats) {
+    emit_progress(
+        progress,
+        LocalCloneProgressEvent::CopyProgress {
+            files: stats.file_count,
+            dirs: stats.dir_count,
+            symlinks: stats.symlink_count,
+            bytes: stats.bytes,
+        },
+    );
+}
+
+fn maybe_emit_copy_progress(
+    progress: Option<&dyn Fn(LocalCloneProgressEvent)>,
+    stats: &CopyStats,
+    throttle: &mut CopyProgressThrottle,
+) {
+    let entries = stats
+        .file_count
+        .saturating_add(stats.dir_count)
+        .saturating_add(stats.symlink_count);
+    if entries >= throttle.next_entries || stats.bytes >= throttle.next_bytes {
+        emit_copy_progress(progress, stats);
+        throttle.next_entries = entries.saturating_add(128);
+        throttle.next_bytes = stats.bytes.saturating_add(8 * 1024 * 1024);
+    }
 }
 
 fn inspect_source_repo(source: &Path) -> Result<(), CloneError> {
@@ -183,7 +295,13 @@ const fn cow_strategy() -> &'static str {
     "linux-ficlone"
 }
 
-fn copy_tree_cow(source: &Path, target: &Path, stats: &mut CopyStats) -> Result<(), CloneError> {
+fn copy_tree_cow(
+    source: &Path,
+    target: &Path,
+    stats: &mut CopyStats,
+    progress: Option<&dyn Fn(LocalCloneProgressEvent)>,
+    progress_throttle: &mut CopyProgressThrottle,
+) -> Result<(), CloneError> {
     let metadata = fs::symlink_metadata(source).map_err(|error| CloneError::LocalCloneFailed {
         path: source.to_owned(),
         operation: "reading source entry metadata",
@@ -197,6 +315,7 @@ fn copy_tree_cow(source: &Path, target: &Path, stats: &mut CopyStats) -> Result<
             detail: error.to_string(),
         })?;
         stats.dir_count += 1;
+        maybe_emit_copy_progress(progress, stats, progress_throttle);
         for entry in fs::read_dir(source).map_err(|error| CloneError::LocalCloneFailed {
             path: source.to_owned(),
             operation: "reading source directory",
@@ -207,7 +326,13 @@ fn copy_tree_cow(source: &Path, target: &Path, stats: &mut CopyStats) -> Result<
                 operation: "reading source directory entry",
                 detail: error.to_string(),
             })?;
-            copy_tree_cow(&entry.path(), &target.join(entry.file_name()), stats)?;
+            copy_tree_cow(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                stats,
+                progress,
+                progress_throttle,
+            )?;
         }
         #[cfg(unix)]
         fs::set_permissions(
@@ -224,6 +349,7 @@ fn copy_tree_cow(source: &Path, target: &Path, stats: &mut CopyStats) -> Result<
     if file_type.is_symlink() {
         copy_symlink(source, target)?;
         stats.symlink_count += 1;
+        maybe_emit_copy_progress(progress, stats, progress_throttle);
         return Ok(());
     }
     #[cfg(unix)]
@@ -241,6 +367,7 @@ fn copy_tree_cow(source: &Path, target: &Path, stats: &mut CopyStats) -> Result<
     clone_file_cow(source, target)?;
     stats.file_count += 1;
     stats.bytes = stats.bytes.saturating_add(metadata.len());
+    maybe_emit_copy_progress(progress, stats, progress_throttle);
     Ok(())
 }
 

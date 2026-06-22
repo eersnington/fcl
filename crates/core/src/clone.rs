@@ -29,11 +29,58 @@ impl CloneRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneProgressPhase {
+    ResolvingRefs,
+    FetchingPack,
+    IndexingObjects,
+    CheckingOut,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneProgressEvent {
+    Started,
+    PhaseStarted(CloneProgressPhase),
+    PhaseCompleted(CloneProgressPhase),
+    FetchProgress { bytes: u64 },
+    Completed,
+}
+
 pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
+    clone_repo_inner(request, None)
+}
+
+pub fn clone_repo_with_progress(
+    request: CloneRequest,
+    progress: impl Fn(CloneProgressEvent),
+) -> Result<CloneReport, CloneError> {
+    clone_repo_inner(request, Some(&progress))
+}
+
+fn clone_repo_inner(
+    request: CloneRequest,
+    progress: Option<&dyn Fn(CloneProgressEvent)>,
+) -> Result<CloneReport, CloneError> {
+    emit_progress(progress, CloneProgressEvent::Started);
     if env_bool("FCL_PIPELINE") {
-        clone_repo_pipelined(request)
+        let result = clone_repo_pipelined(request, progress);
+        if result.is_ok() {
+            emit_progress(progress, CloneProgressEvent::Completed);
+        }
+        result
     } else {
-        clone_repo_sequential(request)
+        let result = clone_repo_sequential(request, progress);
+        if result.is_ok() {
+            emit_progress(progress, CloneProgressEvent::Completed);
+        }
+        result
+    }
+}
+
+fn emit_progress(progress: Option<&dyn Fn(CloneProgressEvent)>, event: CloneProgressEvent) {
+    if let Some(progress) = progress {
+        progress(event);
     }
 }
 
@@ -41,15 +88,26 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
     clippy::too_many_lines,
     reason = "top-level clone orchestration keeps phase timing and report assembly together"
 )]
-fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneError> {
+fn clone_repo_sequential(
+    request: CloneRequest,
+    progress: Option<&dyn Fn(CloneProgressEvent)>,
+) -> Result<CloneReport, CloneError> {
     let start = Instant::now();
     let client = http_client()?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::ResolvingRefs),
+    );
     let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
     let remote = remote?;
     let refs = remote.refs.select_full_clone_universe();
     let ref_count = refs.len();
     let default_branch = resolve_default_branch(remote.refs.default_branch.as_deref(), &refs)?;
     let default_commit = ObjectId::parse_hex(&default_branch.oid)?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::ResolvingRefs),
+    );
 
     let target = match request.target {
         Some(target) => target,
@@ -59,8 +117,22 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
     let repo = staged_repo.layout()?;
     let max_temp_bytes = optional_u64_env("FCL_MAX_TEMP_BYTES")?;
 
-    let (fetched_pack, fetch_ms) =
-        measure_ms(|| fetch_full_pack(&client, &remote, &refs, &repo.pack_temp_path()));
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::FetchingPack),
+    );
+    let fetch_progress = |bytes| {
+        emit_progress(progress, CloneProgressEvent::FetchProgress { bytes });
+    };
+    let (fetched_pack, fetch_ms) = measure_ms(|| {
+        fetch_full_pack(
+            &client,
+            &remote,
+            &refs,
+            &repo.pack_temp_path(),
+            Some(&fetch_progress),
+        )
+    });
     let fetched_pack = fetched_pack?;
     let pack_bytes = fetched_pack.bytes;
     enforce_optional_max_bytes(
@@ -70,10 +142,18 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
         "checking fetched pack size",
     )?;
     enforce_target_size_limit(max_temp_bytes, repo, "checking target size after fetch")?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::FetchingPack),
+    );
     let streaming_pack_scan = fetched_pack.scan.is_some();
     let ingest_options = PackIngestOptions {
         checkout_hint: Some(CheckoutHint { default_commit }),
     };
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::IndexingObjects),
+    );
     let (ingest_report, ingest_ms) = measure_ms(|| {
         if let Some(scan) = fetched_pack.scan.as_ref() {
             let pack = PackStorage::open_file_backed(&repo.pack_temp_path())?;
@@ -95,6 +175,10 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
         }
     });
     let ingest_report = ingest_report?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::IndexingObjects),
+    );
     let pack_scan_ms = ingest_report.scan_ms;
     let pack_resolve_ms = ingest_report.resolve_ms;
     let pack_idx_write_ms = ingest_report.idx_write_ms;
@@ -112,11 +196,23 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
     let checkout_missing_blob_count = ingest_report.checkout_missing_blob_count;
     repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
     enforce_target_size_limit(max_temp_bytes, repo, "checking target size after ingest")?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::CheckingOut),
+    );
     let (checkout, checkout_ms) =
         measure_ms(|| materialize_default_branch(repo, &pack_index, default_commit));
     let checkout = checkout?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::CheckingOut),
+    );
     let reconstructed_object_count = pack_index.reconstructed_object_count();
     let total_ms = start.elapsed().as_millis();
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::Finalizing),
+    );
     let repo = staged_repo.commit()?;
     let target_bytes = directory_bytes(repo.root())?;
     let rss_bytes = rss_bytes();
@@ -126,6 +222,10 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
         target_bytes,
         "checking final target size",
     )?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::Finalizing),
+    );
 
     Ok(CloneReport {
         compression_backend: compression_backend(),
@@ -173,15 +273,26 @@ fn clone_repo_sequential(request: CloneRequest) -> Result<CloneReport, CloneErro
     clippy::too_many_lines,
     reason = "top-level pipeline orchestration keeps thread joins, timings, and report assembly together"
 )]
-fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError> {
+fn clone_repo_pipelined(
+    request: CloneRequest,
+    progress: Option<&dyn Fn(CloneProgressEvent)>,
+) -> Result<CloneReport, CloneError> {
     let start = Instant::now();
     let client = http_client()?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::ResolvingRefs),
+    );
     let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
     let remote = remote?;
     let refs = remote.refs.select_full_clone_universe();
     let ref_count = refs.len();
     let default_branch = resolve_default_branch(remote.refs.default_branch.as_deref(), &refs)?;
     let default_commit = ObjectId::parse_hex(&default_branch.oid)?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::ResolvingRefs),
+    );
 
     let target = match request.target {
         Some(target) => target,
@@ -201,6 +312,10 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
     let fetch_remote = remote.clone();
     let fetch_refs = refs.clone();
     let fetch_pack_path = pack_path.clone();
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::FetchingPack),
+    );
     let fetch_thread = thread::spawn(move || {
         let fetch_start = Instant::now();
         fetch_full_pack_pipelined(
@@ -209,6 +324,7 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
             &fetch_refs,
             &fetch_pack_path,
             &sender,
+            None,
         )
         .map(|fetched_pack| (fetched_pack, fetch_start.elapsed().as_millis()))
     });
@@ -216,6 +332,10 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
     let resolver_store = store.clone();
     let resolver_pack_path = pack_path.clone();
     let resolver_index_path = index_path;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::IndexingObjects),
+    );
     let resolver_thread = thread::spawn(move || {
         let result = ingest_pack_pipeline(
             &resolver_pack_path,
@@ -230,6 +350,10 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
     });
 
     let checkout_start = Instant::now();
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::CheckingOut),
+    );
     let checkout_result = materialize_default_branch(repo, &store, default_commit);
     let checkout_ms = checkout_start.elapsed().as_millis();
 
@@ -241,6 +365,10 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
             detail: "fetch thread panicked".to_owned(),
         })?;
     let (fetched_pack, fetch_ms) = fetch_joined?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::FetchingPack),
+    );
     let pack_bytes = fetched_pack.bytes;
     enforce_optional_max_bytes(
         "FCL_MAX_PACK_BYTES",
@@ -256,8 +384,20 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
             operation: "joining pipeline resolver thread",
             detail: "resolver thread panicked".to_owned(),
         })??;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::IndexingObjects),
+    );
     let checkout = checkout_result?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::CheckingOut),
+    );
     let pack_index = ingest_report.index;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseStarted(CloneProgressPhase::Finalizing),
+    );
     enforce_target_size_limit(
         max_temp_bytes,
         repo,
@@ -274,6 +414,10 @@ fn clone_repo_pipelined(request: CloneRequest) -> Result<CloneReport, CloneError
         target_bytes,
         "checking final target size",
     )?;
+    emit_progress(
+        progress,
+        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::Finalizing),
+    );
 
     Ok(CloneReport {
         compression_backend: compression_backend(),
