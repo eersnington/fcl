@@ -52,9 +52,14 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         directory_bytes(repo.root())?,
         "checking target size after fetch",
     )?;
-    let (pack_index, ingest_ms) =
+    let (ingest_report, ingest_ms) =
         measure_ms(|| ingest_pack(&repo.pack_temp_path(), &repo.pack_index_temp_path()));
-    let pack_index = pack_index?;
+    let ingest_report = ingest_report?;
+    let pack_scan_ms = ingest_report.scan_ms;
+    let pack_resolve_ms = ingest_report.resolve_ms;
+    let pack_idx_write_ms = ingest_report.idx_write_ms;
+    let pack_object_state_ms = ingest_report.object_state_ms;
+    let pack_index = ingest_report.index;
     let retained_object_count = pack_index.retained_object_count();
     let retained_object_bytes = pack_index.retained_object_bytes();
     let spilled_object_count = pack_index.spilled_object_count();
@@ -84,6 +89,10 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
         discovery_ms,
         fetch_ms,
         ingest_ms,
+        pack_scan_ms,
+        pack_resolve_ms,
+        pack_idx_write_ms,
+        pack_object_state_ms,
         checkout_ms,
         checkout_manifest_ms: checkout.manifest_ms,
         checkout_dir_create_ms: checkout.dir_create_ms,

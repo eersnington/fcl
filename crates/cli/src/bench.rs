@@ -47,6 +47,10 @@ struct BenchResult {
     discovery_ms: Option<u128>,
     fetch_ms: Option<u128>,
     ingest_ms: Option<u128>,
+    pack_scan_ms: Option<u128>,
+    pack_resolve_ms: Option<u128>,
+    pack_idx_write_ms: Option<u128>,
+    pack_object_state_ms: Option<u128>,
     checkout_ms: Option<u128>,
     checkout_manifest_ms: Option<u128>,
     checkout_dir_create_ms: Option<u128>,
@@ -64,6 +68,7 @@ struct BenchResult {
     reconstructed_object_count: Option<usize>,
     target_bytes: Option<u64>,
     rss_bytes: Option<u64>,
+    git_trace_path: Option<PathBuf>,
     validated: bool,
 }
 
@@ -77,10 +82,11 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
 
     if cli.output.csv {
         println!(
-            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,reconstructed_object_count,target_bytes,rss_bytes,validated"
+            "url,tool,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,reconstructed_object_count,target_bytes,rss_bytes,git_trace_path,validated"
         );
     }
 
+    let mut results = Vec::new();
     for run in 1..=cli.runs {
         let target = bench_target("fcl", run);
         remove_target(&target)?;
@@ -90,12 +96,14 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
         }
         let result = BenchResult::from_fcl(run, &report, cli.validate);
         print_result(cli, &result);
+        results.push(result);
 
         if cli.compare_git {
             let target = bench_target("git", run);
             remove_target(&target)?;
             let start = Instant::now();
-            run_git_clone(&cli.url, &target)?;
+            let trace_path = git_trace_path(run);
+            run_git_clone(&cli.url, &target, &trace_path)?;
             let total_ms = start.elapsed().as_millis();
             if cli.validate {
                 validate_repo(&target)?;
@@ -107,6 +115,10 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
                 discovery_ms: None,
                 fetch_ms: None,
                 ingest_ms: None,
+                pack_scan_ms: None,
+                pack_resolve_ms: None,
+                pack_idx_write_ms: None,
+                pack_object_state_ms: None,
                 checkout_ms: None,
                 checkout_manifest_ms: None,
                 checkout_dir_create_ms: None,
@@ -124,11 +136,15 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
                 reconstructed_object_count: None,
                 target_bytes: target_size(&target).ok(),
                 rss_bytes: None,
+                git_trace_path: Some(trace_path),
                 validated: cli.validate,
             };
             print_result(cli, &result);
+            results.push(result);
         }
     }
+
+    print_summaries(cli, &results);
 
     Ok(())
 }
@@ -142,6 +158,10 @@ impl BenchResult {
             discovery_ms: Some(report.discovery_ms),
             fetch_ms: Some(report.fetch_ms),
             ingest_ms: Some(report.ingest_ms),
+            pack_scan_ms: Some(report.pack_scan_ms),
+            pack_resolve_ms: Some(report.pack_resolve_ms),
+            pack_idx_write_ms: Some(report.pack_idx_write_ms),
+            pack_object_state_ms: Some(report.pack_object_state_ms),
             checkout_ms: Some(report.checkout_ms),
             checkout_manifest_ms: Some(report.checkout_manifest_ms),
             checkout_dir_create_ms: Some(report.checkout_dir_create_ms),
@@ -159,6 +179,7 @@ impl BenchResult {
             reconstructed_object_count: Some(report.reconstructed_object_count),
             target_bytes: Some(report.target_bytes),
             rss_bytes: report.rss_bytes,
+            git_trace_path: None,
             validated,
         }
     }
@@ -208,8 +229,15 @@ fn remove_target(target: &Path) -> Result<(), CloneError> {
     Ok(())
 }
 
-fn run_git_clone(url: &str, target: &Path) -> Result<(), CloneError> {
+fn git_trace_path(run: usize) -> PathBuf {
+    std::env::temp_dir()
+        .join("fcl-bench")
+        .join(format!("git-trace-{run}.txt"))
+}
+
+fn run_git_clone(url: &str, target: &Path, trace_path: &Path) -> Result<(), CloneError> {
     let output = Command::new("git")
+        .env("GIT_TRACE_PERFORMANCE", "1")
         .arg("clone")
         .arg(url)
         .arg(target)
@@ -218,6 +246,10 @@ fn run_git_clone(url: &str, target: &Path) -> Result<(), CloneError> {
             operation: "running git clone",
             detail: error.to_string(),
         })?;
+    fs::write(trace_path, &output.stderr).map_err(|error| CloneError::BenchmarkFailed {
+        operation: "writing git performance trace",
+        detail: format!("{}: {error}", trace_path.display()),
+    })?;
     if !output.status.success() {
         return Err(CloneError::BenchmarkFailed {
             operation: "running git clone",
@@ -270,7 +302,7 @@ fn print_result(cli: &BenchCli, result: &BenchResult) {
 
 fn print_json_result(url: &str, result: &BenchResult) {
     println!(
-        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"validated\":{}}}",
+        "{{\"url\":\"{}\",\"tool\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"reconstructed_object_count\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"validated\":{}}}",
         escape_json(url),
         result.tool,
         result.run,
@@ -278,6 +310,10 @@ fn print_json_result(url: &str, result: &BenchResult) {
         option_u128(result.discovery_ms),
         option_u128(result.fetch_ms),
         option_u128(result.ingest_ms),
+        option_u128(result.pack_scan_ms),
+        option_u128(result.pack_resolve_ms),
+        option_u128(result.pack_idx_write_ms),
+        option_u128(result.pack_object_state_ms),
         option_u128(result.checkout_ms),
         option_u128(result.checkout_manifest_ms),
         option_u128(result.checkout_dir_create_ms),
@@ -295,13 +331,14 @@ fn print_json_result(url: &str, result: &BenchResult) {
         option_usize(result.reconstructed_object_count),
         option_u64(result.target_bytes),
         option_u64(result.rss_bytes),
+        option_path(result.git_trace_path.as_deref()),
         result.validated
     );
 }
 
 fn print_csv_result(url: &str, result: &BenchResult) {
     println!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         url,
         result.tool,
         result.run,
@@ -309,6 +346,10 @@ fn print_csv_result(url: &str, result: &BenchResult) {
         csv_u128(result.discovery_ms),
         csv_u128(result.fetch_ms),
         csv_u128(result.ingest_ms),
+        csv_u128(result.pack_scan_ms),
+        csv_u128(result.pack_resolve_ms),
+        csv_u128(result.pack_idx_write_ms),
+        csv_u128(result.pack_object_state_ms),
         csv_u128(result.checkout_ms),
         csv_u128(result.checkout_manifest_ms),
         csv_u128(result.checkout_dir_create_ms),
@@ -326,19 +367,24 @@ fn print_csv_result(url: &str, result: &BenchResult) {
         csv_usize(result.reconstructed_object_count),
         csv_u64(result.target_bytes),
         csv_u64(result.rss_bytes),
+        csv_path(result.git_trace_path.as_deref()),
         result.validated
     );
 }
 
 fn print_plain_result(result: &BenchResult) {
     println!(
-        "{} run {}: total={}ms discovery={} fetch={} ingest={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} reconstructed_objects={} target_bytes={} rss={} validated={}",
+        "{} run {}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} reconstructed_objects={} target_bytes={} rss={} git_trace={} validated={}",
         result.tool,
         result.run,
         result.total_ms,
         ms_or_dash(result.discovery_ms),
         ms_or_dash(result.fetch_ms),
         ms_or_dash(result.ingest_ms),
+        ms_or_dash(result.pack_scan_ms),
+        ms_or_dash(result.pack_resolve_ms),
+        ms_or_dash(result.pack_idx_write_ms),
+        ms_or_dash(result.pack_object_state_ms),
         ms_or_dash(result.checkout_ms),
         ms_or_dash(result.checkout_manifest_ms),
         ms_or_dash(result.checkout_dir_create_ms),
@@ -356,8 +402,59 @@ fn print_plain_result(result: &BenchResult) {
         usize_or_dash(result.reconstructed_object_count),
         u64_or_dash(result.target_bytes),
         u64_or_dash(result.rss_bytes),
+        path_or_dash(result.git_trace_path.as_deref()),
         result.validated
     );
+}
+
+fn print_summaries(cli: &BenchCli, results: &[BenchResult]) {
+    if cli.output.csv || cli.output.json {
+        return;
+    }
+    for tool in ["fcl", "git"] {
+        let totals = results
+            .iter()
+            .filter(|result| result.tool == tool)
+            .map(|result| result.total_ms)
+            .collect::<Vec<_>>();
+        let Some(summary) = TimingSummary::from_samples(&totals) else {
+            continue;
+        };
+        println!(
+            "{} summary: total median={}ms min={}ms max={}ms samples={}",
+            tool, summary.median_ms, summary.min_ms, summary.max_ms, summary.samples
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimingSummary {
+    samples: usize,
+    median_ms: u128,
+    min_ms: u128,
+    max_ms: u128,
+}
+
+impl TimingSummary {
+    fn from_samples(samples: &[u128]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        let median_ms = if len.is_multiple_of(2) {
+            u128::midpoint(sorted[len / 2 - 1], sorted[len / 2])
+        } else {
+            sorted[len / 2]
+        };
+        Some(Self {
+            samples: len,
+            median_ms,
+            min_ms: sorted[0],
+            max_ms: sorted[len - 1],
+        })
+    }
 }
 
 fn option_u128(value: Option<u128>) -> String {
@@ -372,6 +469,13 @@ fn option_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "null".to_owned(), |value| value.to_string())
 }
 
+fn option_path(value: Option<&Path>) -> String {
+    value.map_or_else(
+        || "null".to_owned(),
+        |value| format!("\"{}\"", escape_json(&value.display().to_string())),
+    )
+}
+
 fn csv_u128(value: Option<u128>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
 }
@@ -382,6 +486,10 @@ fn csv_u64(value: Option<u64>) -> String {
 
 fn csv_usize(value: Option<usize>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
+}
+
+fn csv_path(value: Option<&Path>) -> String {
+    value.map_or_else(String::new, |value| value.display().to_string())
 }
 
 fn ms_or_dash(value: Option<u128>) -> String {
@@ -396,6 +504,58 @@ fn usize_or_dash(value: Option<usize>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.to_string())
 }
 
+fn path_or_dash(value: Option<&Path>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.display().to_string())
+}
+
 fn escape_json(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TimingSummary, csv_path, option_path};
+    use std::path::Path;
+
+    #[test]
+    fn timing_summary_should_report_median_min_and_max_for_odd_samples() {
+        let summary = TimingSummary::from_samples(&[30, 10, 20]).expect("summary should exist");
+
+        assert_eq!(
+            summary,
+            TimingSummary {
+                samples: 3,
+                median_ms: 20,
+                min_ms: 10,
+                max_ms: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn timing_summary_should_report_integer_median_for_even_samples() {
+        let summary = TimingSummary::from_samples(&[10, 40, 20, 30]).expect("summary should exist");
+
+        assert_eq!(summary.median_ms, 25);
+    }
+
+    #[test]
+    fn timing_summary_should_reject_empty_samples() {
+        assert_eq!(TimingSummary::from_samples(&[]), None);
+    }
+
+    #[test]
+    fn path_output_should_render_json_null_for_missing_path() {
+        assert_eq!(option_path(None), "null");
+    }
+
+    #[test]
+    fn path_output_should_render_csv_empty_for_missing_path() {
+        assert_eq!(csv_path(None), "");
+    }
+
+    #[test]
+    fn path_output_should_escape_json_path() {
+        assert_eq!(option_path(Some(Path::new("a\"b"))), "\"a\\\"b\"");
+    }
 }

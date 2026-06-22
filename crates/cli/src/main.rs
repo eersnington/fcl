@@ -66,6 +66,13 @@ fn main() {
                 report.discovery_ms, report.fetch_ms, report.ingest_ms, report.checkout_ms
             );
             eprintln!(
+                "fcl: pack scan={}ms resolve={}ms idx_write={}ms object_state={}ms",
+                report.pack_scan_ms,
+                report.pack_resolve_ms,
+                report.pack_idx_write_ms,
+                report.pack_object_state_ms
+            );
+            eprintln!(
                 "fcl: checkout manifest={}ms dirs={}ms files={}ms index={}ms files={} dirs={} blob_bytes={}",
                 report.checkout_manifest_ms,
                 report.checkout_dir_create_ms,

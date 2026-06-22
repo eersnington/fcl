@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crc32fast::Hasher as Crc32;
 use flate2::{Decompress, FlushDecompress, Status};
@@ -109,6 +110,15 @@ pub struct PackIndex {
     spilled_object_count: usize,
     spilled_object_bytes: usize,
     reconstructed_object_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug)]
+pub struct PackIngestReport {
+    pub index: PackIndex,
+    pub scan_ms: u128,
+    pub resolve_ms: u128,
+    pub idx_write_ms: u128,
+    pub object_state_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -383,7 +393,7 @@ struct DeltaAdjacency {
     delta_count: usize,
 }
 
-pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIndex, CloneError> {
+pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIngestReport, CloneError> {
     let pack = fs::read(pack_path).map_err(|error| CloneError::PackIndexFailed {
         path: pack_path.to_owned(),
         operation: "reading pack file",
@@ -396,8 +406,24 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIndex, Clo
     } else {
         ScanPayload::Inflate
     };
+    let scan_start = Instant::now();
     let scan = scan_pack(pack_path, pack.as_ref(), scan_payload)?;
+    let scan_ms = scan_start.elapsed().as_millis();
+
+    ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms)
+}
+
+fn ingest_scanned_pack(
+    pack_path: &Path,
+    index_path: &Path,
+    pack: Arc<[u8]>,
+    scan: &PackScan,
+    scan_ms: u128,
+) -> Result<PackIngestReport, CloneError> {
+    let resolve_start = Instant::now();
     let resolved = resolve_inflated_frames(pack_path, pack.as_ref(), &scan.frames)?;
+    let resolve_ms = resolve_start.elapsed().as_millis();
+
     let mut entries = resolved
         .iter()
         .map(|frame| IndexEntry {
@@ -407,8 +433,11 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIndex, Clo
         })
         .collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| left.oid.cmp(&right.oid));
+    let idx_write_start = Instant::now();
     write_idx_v2(index_path, &entries, &scan.checksum)?;
+    let idx_write_ms = idx_write_start.elapsed().as_millis();
 
+    let object_state_start = Instant::now();
     let mut meta_by_oid = HashMap::with_capacity(resolved.len());
     let mut oid_by_offset = HashMap::with_capacity(resolved.len());
     for frame in &resolved {
@@ -441,17 +470,25 @@ pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIndex, Clo
         .unwrap_or_else(|| Path::new("."))
         .join("fcl-spill");
     let cache = build_object_states(pack_path, &spill_dir, resolved)?;
-    Ok(PackIndex {
-        pack_path: pack_path.to_owned(),
-        pack,
-        meta_by_oid,
-        oid_by_offset,
-        state_by_oid: cache.state_by_oid,
-        retained_object_count: cache.retained_object_count,
-        retained_object_bytes: cache.retained_object_bytes,
-        spilled_object_count: cache.spilled_object_count,
-        spilled_object_bytes: cache.spilled_object_bytes,
-        reconstructed_object_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    let object_state_ms = object_state_start.elapsed().as_millis();
+
+    Ok(PackIngestReport {
+        index: PackIndex {
+            pack_path: pack_path.to_owned(),
+            pack,
+            meta_by_oid,
+            oid_by_offset,
+            state_by_oid: cache.state_by_oid,
+            retained_object_count: cache.retained_object_count,
+            retained_object_bytes: cache.retained_object_bytes,
+            spilled_object_count: cache.spilled_object_count,
+            spilled_object_bytes: cache.spilled_object_bytes,
+            reconstructed_object_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        },
+        scan_ms,
+        resolve_ms,
+        idx_write_ms,
+        object_state_ms,
     })
 }
 
@@ -1414,4 +1451,124 @@ fn validate_unique_objects(index_path: &Path, entries: &[IndexEntry]) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PackIndex, ScanPayload, ingest_pack, ingest_scanned_pack, scan_pack};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ingest_scanned_pack_should_match_complete_ingest() {
+        let temp = test_temp_dir("ingest-scanned-pack");
+        let repo = temp.join("repo");
+        fs::create_dir(&repo).expect("repo directory should be created");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "fcl test"]);
+        run_git(&repo, &["config", "user.email", "fcl@example.invalid"]);
+        fs::write(repo.join("file.txt"), "alpha\n").expect("file should be written");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        fs::write(repo.join("file.txt"), "alpha\nbeta\ngamma\n").expect("file should be updated");
+        fs::write(repo.join("other.txt"), "alpha\nbeta\n").expect("second file should be written");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "update"]);
+        run_git(&repo, &["repack", "-ad"]);
+
+        let pack_path = only_pack_path(&repo);
+        let complete_idx = temp.join("complete.idx");
+        let scanned_idx = temp.join("scanned.idx");
+        let complete = ingest_pack(&pack_path, &complete_idx).expect("complete ingest should work");
+
+        let pack = fs::read(&pack_path).expect("pack should be readable");
+        let pack = Arc::<[u8]>::from(pack);
+        let scan_payload = if std::env::var("FCL_LOW_MEMORY").is_ok() {
+            ScanPayload::MetadataOnly
+        } else {
+            ScanPayload::Inflate
+        };
+        let scan = scan_pack(&pack_path, pack.as_ref(), scan_payload).expect("scan should work");
+        let scanned = ingest_scanned_pack(&pack_path, &scanned_idx, pack, &scan, 0)
+            .expect("scanned ingest should work");
+
+        assert_eq!(
+            fs::read(complete_idx).expect("complete idx should exist"),
+            fs::read(scanned_idx).expect("scanned idx should exist")
+        );
+        assert_same_index_metadata(&complete.index, &scanned.index);
+
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("fcl-{name}-{}-{stamp}", std::process::id()));
+        fs::create_dir(&path).expect("test temp directory should be created");
+        path
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {} failed: stdout=`{}` stderr=`{}`",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn only_pack_path(repo: &Path) -> PathBuf {
+        let pack_dir = repo.join(".git/objects/pack");
+        let packs = fs::read_dir(&pack_dir)
+            .expect("pack directory should be readable")
+            .map(|entry| entry.expect("pack dir entry should be readable").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            packs.len(),
+            1,
+            "expected one pack in {}",
+            pack_dir.display()
+        );
+        packs[0].clone()
+    }
+
+    fn assert_same_index_metadata(left: &PackIndex, right: &PackIndex) {
+        assert_eq!(left.meta_by_oid.len(), right.meta_by_oid.len());
+        assert_eq!(left.oid_by_offset, right.oid_by_offset);
+        assert_eq!(left.retained_object_count, right.retained_object_count);
+        assert_eq!(left.retained_object_bytes, right.retained_object_bytes);
+        assert_eq!(left.spilled_object_count, right.spilled_object_count);
+        assert_eq!(left.spilled_object_bytes, right.spilled_object_bytes);
+        for (oid, left_meta) in &left.meta_by_oid {
+            let right_meta = right
+                .meta_by_oid
+                .get(oid)
+                .expect("right index should contain oid");
+            assert_eq!(left_meta.object_type, right_meta.object_type);
+            assert_eq!(left_meta.size, right_meta.size);
+            assert_eq!(left_meta.pack_inflated_size, right_meta.pack_inflated_size);
+            assert_eq!(left_meta.pack_offset, right_meta.pack_offset);
+            assert_eq!(left_meta.compressed_start, right_meta.compressed_start);
+            assert_eq!(left_meta.compressed_len, right_meta.compressed_len);
+            assert_eq!(left_meta.crc32, right_meta.crc32);
+            assert_eq!(left_meta.delta_base, right_meta.delta_base);
+        }
+    }
 }
