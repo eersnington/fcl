@@ -17,6 +17,8 @@ use crate::pack::{
 use crate::protocol::{discover_remote, fetch_full_pack, fetch_full_pack_pipelined, http_client};
 use crate::repo::{FinalizingRepo, RepoLayout};
 
+type ProgressCallback<'a> = dyn Fn(CloneProgressEvent) + Sync + 'a;
+
 #[derive(Debug)]
 pub struct CloneRequest {
     pub url: String,
@@ -64,14 +66,14 @@ pub fn clone_repo(request: CloneRequest) -> Result<CloneReport, CloneError> {
 
 pub fn clone_repo_with_progress(
     request: CloneRequest,
-    progress: impl Fn(CloneProgressEvent),
+    progress: impl Fn(CloneProgressEvent) + Sync,
 ) -> Result<CloneReport, CloneError> {
     clone_repo_inner(request, Some(&progress))
 }
 
 fn clone_repo_inner(
     request: CloneRequest,
-    progress: Option<&dyn Fn(CloneProgressEvent)>,
+    progress: Option<&ProgressCallback<'_>>,
 ) -> Result<CloneReport, CloneError> {
     emit_progress(progress, CloneProgressEvent::Started);
     let use_pipeline = pipeline_enabled_for_request(&request);
@@ -106,7 +108,7 @@ const fn pipeline_enabled(
     (request_pipeline || force_pipeline) && !disable_pipeline
 }
 
-fn emit_progress(progress: Option<&dyn Fn(CloneProgressEvent)>, event: CloneProgressEvent) {
+fn emit_progress(progress: Option<&ProgressCallback<'_>>, event: CloneProgressEvent) {
     if let Some(progress) = progress {
         progress(event);
     }
@@ -118,7 +120,7 @@ fn emit_progress(progress: Option<&dyn Fn(CloneProgressEvent)>, event: CloneProg
 )]
 fn clone_repo_sequential(
     request: CloneRequest,
-    progress: Option<&dyn Fn(CloneProgressEvent)>,
+    progress: Option<&ProgressCallback<'_>>,
 ) -> Result<CloneReport, CloneError> {
     let start = Instant::now();
     let client = http_client()?;
@@ -341,7 +343,7 @@ fn clone_repo_sequential(
 )]
 fn clone_repo_pipelined(
     request: CloneRequest,
-    progress: Option<&dyn Fn(CloneProgressEvent)>,
+    progress: Option<&ProgressCallback<'_>>,
 ) -> Result<CloneReport, CloneError> {
     let start = Instant::now();
     let client = http_client()?;
@@ -382,92 +384,102 @@ fn clone_repo_pipelined(
         progress,
         CloneProgressEvent::PhaseStarted(CloneProgressPhase::FetchingPack),
     );
-    let fetch_thread = thread::spawn(move || {
-        let fetch_start = Instant::now();
-        fetch_full_pack_pipelined(
-            &fetch_client,
-            &fetch_remote,
-            &fetch_refs,
-            &fetch_pack_path,
-            &sender,
-            None,
-        )
-        .map(|fetched_pack| (fetched_pack, fetch_start.elapsed().as_millis()))
-    });
+    let fetch_progress = |bytes| {
+        emit_progress(progress, CloneProgressEvent::FetchProgress { bytes });
+    };
 
     let resolver_store = store.clone();
     let resolver_pack_path = pack_path.clone();
     let resolver_index_path = index_path;
-    emit_progress(
-        progress,
-        CloneProgressEvent::PhaseStarted(CloneProgressPhase::IndexingObjects),
-    );
-    let resolver_thread = thread::spawn(move || {
-        let result = ingest_pack_pipeline(
-            &resolver_pack_path,
-            &resolver_index_path,
-            &receiver,
-            resolver_store.clone(),
+    let (fetched_pack, fetch_ms, ingest_report, checkout, checkout_ms) = thread::scope(|scope| {
+        let fetch_progress = &fetch_progress;
+        let fetch_thread = scope.spawn(move || {
+            let fetch_start = Instant::now();
+            fetch_full_pack_pipelined(
+                &fetch_client,
+                &fetch_remote,
+                &fetch_refs,
+                &fetch_pack_path,
+                &sender,
+                Some(fetch_progress),
+            )
+            .map(|fetched_pack| (fetched_pack, fetch_start.elapsed().as_millis()))
+        });
+
+        emit_progress(
+            progress,
+            CloneProgressEvent::PhaseStarted(CloneProgressPhase::IndexingObjects),
         );
-        if let Err(error) = &result {
-            resolver_store.fail("resolving pipeline pack", error.to_string());
-        }
-        result
-    });
+        let resolver_thread = scope.spawn(move || {
+            let result = ingest_pack_pipeline(
+                &resolver_pack_path,
+                &resolver_index_path,
+                &receiver,
+                resolver_store.clone(),
+            );
+            if let Err(error) = &result {
+                resolver_store.fail("resolving pipeline pack", error.to_string());
+            }
+            result
+        });
 
-    let checkout_start = Instant::now();
-    emit_progress(
-        progress,
-        CloneProgressEvent::PhaseStarted(CloneProgressPhase::CheckingOut),
-    );
-    let checkout_result = materialize_default_branch(repo, &store, default_commit);
-    let checkout_ms = checkout_start.elapsed().as_millis();
+        let checkout_start = Instant::now();
+        emit_progress(
+            progress,
+            CloneProgressEvent::PhaseStarted(CloneProgressPhase::CheckingOut),
+        );
+        let checkout_result = materialize_default_branch(repo, &store, default_commit);
+        let checkout_ms = checkout_start.elapsed().as_millis();
 
-    let fetch_result = fetch_thread
-        .join()
-        .map_err(|_| CloneError::RemoteDiscoveryFailed {
-            url: remote.url.clone(),
-            operation: "joining pipeline fetch thread",
-            detail: "fetch thread panicked".to_owned(),
-        })
-        .and_then(|result| result);
-    let resolver_result = resolver_thread
-        .join()
-        .map_err(|_| CloneError::PackIndexFailed {
-            path: pack_path.clone(),
-            operation: "joining pipeline resolver thread",
-            detail: "resolver thread panicked".to_owned(),
-        })
-        .and_then(|result| result);
-    let (fetched_pack, fetch_ms, ingest_report) = match (fetch_result, resolver_result) {
-        (Ok((fetched_pack, fetch_ms)), Ok(ingest_report)) => {
-            (fetched_pack, fetch_ms, ingest_report)
-        }
-        (Err(_fetch_error), Err(resolver_error)) => return Err(resolver_error),
-        (Err(fetch_error), Ok(_)) => return Err(fetch_error),
-        (Ok(_), Err(resolver_error)) => return Err(resolver_error),
-    };
-    emit_progress(
-        progress,
-        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::FetchingPack),
-    );
+        let fetch_result = fetch_thread
+            .join()
+            .map_err(|_| CloneError::RemoteDiscoveryFailed {
+                url: remote.url.clone(),
+                operation: "joining pipeline fetch thread",
+                detail: "fetch thread panicked".to_owned(),
+            })
+            .and_then(|result| result);
+        let resolver_result = resolver_thread
+            .join()
+            .map_err(|_| CloneError::PackIndexFailed {
+                path: pack_path.clone(),
+                operation: "joining pipeline resolver thread",
+                detail: "resolver thread panicked".to_owned(),
+            })
+            .and_then(|result| result);
+        let (fetched_pack, fetch_ms, ingest_report) = match (fetch_result, resolver_result) {
+            (Ok((fetched_pack, fetch_ms)), Ok(ingest_report)) => {
+                (fetched_pack, fetch_ms, ingest_report)
+            }
+            (Err(_fetch_error), Err(resolver_error)) => return Err(resolver_error),
+            (Err(fetch_error), Ok(_)) => return Err(fetch_error),
+            (Ok(_), Err(resolver_error)) => return Err(resolver_error),
+        };
+        emit_progress(
+            progress,
+            CloneProgressEvent::PhaseCompleted(CloneProgressPhase::FetchingPack),
+        );
+        let pack_bytes = fetched_pack.bytes;
+        enforce_optional_max_bytes(
+            "FCL_MAX_PACK_BYTES",
+            optional_u64_env("FCL_MAX_PACK_BYTES")?,
+            pack_bytes,
+            "checking fetched pack size",
+        )?;
+
+        emit_progress(
+            progress,
+            CloneProgressEvent::PhaseCompleted(CloneProgressPhase::IndexingObjects),
+        );
+        let checkout = checkout_result?;
+        emit_progress(
+            progress,
+            CloneProgressEvent::PhaseCompleted(CloneProgressPhase::CheckingOut),
+        );
+
+        Ok::<_, CloneError>((fetched_pack, fetch_ms, ingest_report, checkout, checkout_ms))
+    })?;
     let pack_bytes = fetched_pack.bytes;
-    enforce_optional_max_bytes(
-        "FCL_MAX_PACK_BYTES",
-        optional_u64_env("FCL_MAX_PACK_BYTES")?,
-        pack_bytes,
-        "checking fetched pack size",
-    )?;
-
-    emit_progress(
-        progress,
-        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::IndexingObjects),
-    );
-    let checkout = checkout_result?;
-    emit_progress(
-        progress,
-        CloneProgressEvent::PhaseCompleted(CloneProgressPhase::CheckingOut),
-    );
     let pack_index = ingest_report.index;
     emit_progress(
         progress,
