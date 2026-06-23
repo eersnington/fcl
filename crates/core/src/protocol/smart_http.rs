@@ -252,6 +252,38 @@ impl Remote {
             .iter()
             .any(|capability| capability.trim_end().starts_with("fetch"))
     }
+
+    pub fn advertised_clone_features(&self) -> Vec<String> {
+        [
+            "bundle-uri",
+            "packfile-uris",
+            "sideband-all",
+            "include-tag",
+            "ref-in-want",
+            "wait-for-done",
+        ]
+        .into_iter()
+        .filter(|feature| self.advertises_capability(feature))
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn advertises_capability(&self, feature: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability_line_has_feature(capability, feature))
+    }
+}
+
+fn capability_line_has_feature(line: &str, feature: &str) -> bool {
+    let line = line.trim_end();
+    if line == feature || line.starts_with(&format!("{feature}=")) {
+        return true;
+    }
+    if let Some((name, values)) = line.split_once('=') {
+        return name == feature || values.split_whitespace().any(|value| value == feature);
+    }
+    line.split_whitespace().any(|value| value == feature)
 }
 
 fn fetch_body_with_remote_progress(refs: &[RemoteRef], remote_progress: bool) -> Vec<u8> {
@@ -938,7 +970,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{PacketReader, RemoteRef, fetch_body_with_remote_progress};
+    use super::{PacketReader, Remote, RemoteRef, RemoteRefs, fetch_body_with_remote_progress};
 
     #[test]
     fn fetch_body_should_request_no_progress_by_default() {
@@ -987,5 +1019,42 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(end.is_none());
+    }
+
+    #[test]
+    fn advertised_clone_features_should_include_top_level_capabilities() {
+        let remote = remote_with_capabilities(["version 2\n", "bundle-uri\n"]);
+
+        assert_eq!(remote.advertised_clone_features(), vec!["bundle-uri"]);
+    }
+
+    #[test]
+    fn advertised_clone_features_should_include_fetch_feature_tokens() {
+        let remote = remote_with_capabilities([
+            "version 2\n",
+            "fetch=shallow filter ref-in-want sideband-all packfile-uris wait-for-done\n",
+        ]);
+
+        assert_eq!(
+            remote.advertised_clone_features(),
+            vec![
+                "packfile-uris",
+                "sideband-all",
+                "ref-in-want",
+                "wait-for-done"
+            ]
+        );
+    }
+
+    fn remote_with_capabilities<const N: usize>(capabilities: [&str; N]) -> Remote {
+        Remote {
+            url: "https://example.com/repo.git".to_owned(),
+            upload_pack_url: "https://example.com/repo.git/git-upload-pack".to_owned(),
+            refs: RemoteRefs {
+                default_branch: None,
+                refs: Vec::new(),
+            },
+            capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+        }
     }
 }

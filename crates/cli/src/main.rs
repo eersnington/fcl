@@ -113,6 +113,9 @@ fn print_clone_summary(report: &CloneReport) {
 
 fn print_clone_stats(report: &CloneReport) {
     eprintln!("fcl: compression backend {}", report.compression_backend);
+    if !report.remote_features.is_empty() {
+        eprintln!("fcl: remote features {}", report.remote_features.join(","));
+    }
     eprintln!("fcl: fetched {} refs", report.ref_count);
     eprintln!("fcl: wrote {} bytes of pack data", report.pack_bytes);
     eprintln!(

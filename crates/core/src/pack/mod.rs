@@ -89,7 +89,6 @@ pub enum DeltaBase {
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     pub object_type: ObjectType,
-    pub size: u64,
     pub pack_inflated_size: u64,
     pub pack_offset: u64,
     pub compressed_start: usize,
@@ -99,7 +98,6 @@ pub struct ObjectMeta {
 }
 
 pub trait ObjectReader: Sync {
-    fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError>;
     fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError>;
     fn stream_blob(&self, oid: ObjectId, out: &mut dyn Write) -> Result<u64, CloneError>;
 }
@@ -397,10 +395,6 @@ impl PipelineObjectStore {
 }
 
 impl ObjectReader for PipelineObjectStore {
-    fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError> {
-        self.wait_for(oid, "object", |state| state.meta_by_oid.get(&oid).cloned())
-    }
-
     fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError> {
         let (meta, object_state) = self.wait_for(oid, "object", |state| {
             Some((
@@ -538,17 +532,6 @@ impl PackStorage {
 }
 
 impl ObjectReader for PackIndex {
-    fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError> {
-        self.meta_by_oid
-            .get(&oid)
-            .cloned()
-            .ok_or_else(|| CloneError::ObjectLookupFailed {
-                oid: oid.to_hex(),
-                expected_type: "object",
-                detail: "object was not present in the fetched pack".to_owned(),
-            })
-    }
-
     fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError> {
         let meta = self
             .meta_by_oid
@@ -931,7 +914,6 @@ pub fn ingest_scanned_pack(
             oid,
             ObjectMeta {
                 object_type: frame.object.object_type,
-                size: frame.object.size,
                 pack_inflated_size: source.declared_size,
                 pack_offset: frame.offset,
                 compressed_start: source.compressed_start,
@@ -1172,7 +1154,6 @@ impl PipelineResolver {
         };
         let meta = ObjectMeta {
             object_type: resolved.object.object_type,
-            size: resolved.object.size,
             pack_inflated_size: source.declared_size,
             pack_offset: resolved.offset,
             compressed_start: source.compressed_start,
@@ -3642,7 +3623,6 @@ mod tests {
                 .get(oid)
                 .expect("right index should contain oid");
             assert_eq!(left_meta.object_type, right_meta.object_type);
-            assert_eq!(left_meta.size, right_meta.size);
             assert_eq!(left_meta.pack_inflated_size, right_meta.pack_inflated_size);
             assert_eq!(left_meta.pack_offset, right_meta.pack_offset);
             assert_eq!(left_meta.compressed_start, right_meta.compressed_start);
@@ -3661,7 +3641,6 @@ mod tests {
                 .get(oid)
                 .expect("right index should contain oid");
             assert_eq!(left_meta.object_type, right_meta.object_type);
-            assert_eq!(left_meta.size, right_meta.size);
             assert_eq!(left_meta.pack_inflated_size, right_meta.pack_inflated_size);
             assert_eq!(left_meta.pack_offset, right_meta.pack_offset);
             assert_eq!(left_meta.compressed_start, right_meta.compressed_start);

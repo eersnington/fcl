@@ -82,9 +82,9 @@ for backend in "${backends[@]}"; do
       fi
       printf '==> backend=%s mode=%s repo=%s\n' "$backend" "$mode" "$repo" >&2
       if [[ "$mode" == pipeline ]]; then
-        FCL_PIPELINE=1 target/release/fcl "${args[@]}" > "$output"
-      else
         target/release/fcl "${args[@]}" > "$output"
+      else
+        target/release/fcl "${args[@]}" --no-pipeline > "$output"
       fi
       if ((csv_header_written == 0)); then
         sed -n '1p' "$output" > "$combined"

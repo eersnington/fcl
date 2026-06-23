@@ -36,7 +36,6 @@ struct CheckoutManifestEntry {
     git_path: Vec<u8>,
     mode: TreeEntryMode,
     oid: ObjectId,
-    size: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,7 +80,6 @@ pub fn materialize_default_branch(
     let manifest_ms = manifest_start.elapsed().as_millis();
     let dir_count = directories.len();
     let file_count = manifest.len();
-    let blob_bytes = manifest.iter().map(|entry| entry.size).sum();
 
     let dir_start = Instant::now();
     create_checkout_directories(repo.root(), directories)?;
@@ -91,6 +89,10 @@ pub fn materialize_default_branch(
     sort_manifest_for_checkout(&mut manifest);
     let mut checkout_entries = materialize_manifest(repo.root(), &manifest, object_reader)?;
     let file_materialize_ms = file_start.elapsed().as_millis();
+    let blob_bytes = checkout_entries
+        .iter()
+        .map(|entry| u64::from(entry.size))
+        .sum();
 
     let index_start = Instant::now();
     write_git_index(&repo.git_index_path(), &mut checkout_entries)?;
@@ -156,20 +158,11 @@ fn collect_tree_manifest(
             }
             TreeEntryMode::Gitlink => {}
             TreeEntryMode::File | TreeEntryMode::Executable | TreeEntryMode::Symlink => {
-                let object = object_reader.read_meta(entry.oid)?;
-                if object.object_type != ObjectType::Blob {
-                    return Err(CloneError::ObjectLookupFailed {
-                        oid: entry.oid.to_hex(),
-                        expected_type: "blob",
-                        detail: format!("found {}", object.object_type.as_git_name()),
-                    });
-                }
                 manifest.push(CheckoutManifestEntry {
                     git_path: git_index_path_bytes(&relative_path),
                     path: relative_path,
                     mode: entry.mode,
                     oid: entry.oid,
-                    size: object.size,
                 });
             }
         }
@@ -235,18 +228,39 @@ fn materialize_manifest(
                 operation: "creating checkout worker pool",
                 detail: error.to_string(),
             })?;
-        pool.install(|| {
-            manifest
-                .par_iter()
-                .map(|entry| materialize_manifest_entry(root, entry, object_reader))
-                .collect()
-        })
+        pool.install(|| materialize_manifest_parallel(root, manifest, object_reader, jobs))
     } else {
-        manifest
-            .par_iter()
-            .map(|entry| materialize_manifest_entry(root, entry, object_reader))
-            .collect()
+        materialize_manifest_parallel(root, manifest, object_reader, rayon::current_num_threads())
     }
+}
+
+fn materialize_manifest_parallel(
+    root: &Path,
+    manifest: &[CheckoutManifestEntry],
+    object_reader: &dyn ObjectReader,
+    worker_count: usize,
+) -> Result<Vec<CheckoutEntry>, CloneError> {
+    let chunk_size = checkout_chunk_size(manifest.len(), worker_count);
+    let chunks = manifest
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|entry| materialize_manifest_entry(root, entry, object_reader))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+fn checkout_chunk_size(entry_count: usize, worker_count: usize) -> usize {
+    if entry_count == 0 {
+        return 1;
+    }
+    let worker_count = worker_count.max(1);
+    let desired_chunks = worker_count.saturating_mul(4).max(1);
+    let adaptive = entry_count.div_ceil(desired_chunks);
+    adaptive.clamp(1, 100)
 }
 
 fn checkout_jobs() -> Result<Option<usize>, CloneError> {
@@ -278,9 +292,10 @@ fn materialize_manifest_entry(
 ) -> Result<CheckoutEntry, CloneError> {
     let path = root.join(&entry.path);
 
-    let metadata = match entry.mode {
+    let (metadata, size) = match entry.mode {
         TreeEntryMode::File | TreeEntryMode::Executable => {
-            materialize_regular_file(&path, entry, object_reader)?
+            let written = materialize_regular_file(&path, entry, object_reader)?;
+            (written.metadata, written.size)
         }
         TreeEntryMode::Symlink => {
             let target = object_reader.read_object(entry.oid)?;
@@ -292,11 +307,13 @@ fn materialize_manifest_entry(
                 });
             }
             create_symlink(&path, target.data.as_ref())?;
-            fs::symlink_metadata(&path).map_err(|error| CloneError::CheckoutFailed {
-                path: path.clone(),
-                operation: "reading checkout metadata",
-                detail: error.to_string(),
-            })?
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| CloneError::CheckoutFailed {
+                    path: path.clone(),
+                    operation: "reading checkout metadata",
+                    detail: error.to_string(),
+                })?;
+            (metadata, target.data.len() as u64)
         }
         TreeEntryMode::Directory | TreeEntryMode::Gitlink => {
             return Err(CloneError::CheckoutFailed {
@@ -315,16 +332,21 @@ fn materialize_manifest_entry(
         git_path: entry.git_path.clone(),
         mode: entry.mode,
         oid: entry.oid,
-        size: index_size(&entry.path, entry.size)?,
+        size: index_size(&entry.path, size)?,
         stat: FileStat::try_from_metadata(&path, &metadata)?,
     })
+}
+
+struct MaterializedRegularFile {
+    metadata: fs::Metadata,
+    size: u64,
 }
 
 fn materialize_regular_file(
     path: &Path,
     entry: &CheckoutManifestEntry,
     object_reader: &dyn ObjectReader,
-) -> Result<fs::Metadata, CloneError> {
+) -> Result<MaterializedRegularFile, CloneError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -340,13 +362,6 @@ fn materialize_regular_file(
             detail: error.to_string(),
         })?;
     let written = object_reader.stream_blob(entry.oid, &mut file)?;
-    if written != entry.size {
-        return Err(CloneError::CheckoutFailed {
-            path: path.to_owned(),
-            operation: "streaming file",
-            detail: format!("wrote {written} bytes, expected {}", entry.size),
-        });
-    }
     #[cfg(unix)]
     if entry.mode == TreeEntryMode::Executable {
         let metadata = file
@@ -365,10 +380,16 @@ fn materialize_regular_file(
                 })?;
         }
     }
-    file.metadata().map_err(|error| CloneError::CheckoutFailed {
-        path: path.to_owned(),
-        operation: "reading checkout metadata",
-        detail: error.to_string(),
+    let metadata = file
+        .metadata()
+        .map_err(|error| CloneError::CheckoutFailed {
+            path: path.to_owned(),
+            operation: "reading checkout metadata",
+            detail: error.to_string(),
+        })?;
+    Ok(MaterializedRegularFile {
+        metadata,
+        size: written,
     })
 }
 
@@ -570,34 +591,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        CheckoutDirectory, create_checkout_directories, git_index_path_bytes,
+        CheckoutDirectory, checkout_chunk_size, create_checkout_directories, git_index_path_bytes,
         materialize_default_branch, path_depth,
     };
     use crate::error::CloneError;
-    use crate::pack::{ObjectBytes, ObjectId, ObjectMeta, ObjectReader, ObjectType};
+    use crate::pack::{ObjectBytes, ObjectId, ObjectReader, ObjectType};
     use crate::repo::RepoLayout;
 
     #[derive(Debug, Default)]
     struct FakeObjectReader {
         objects: HashMap<ObjectId, ObjectBytes>,
-        meta: HashMap<ObjectId, ObjectMeta>,
     }
 
     impl FakeObjectReader {
         fn insert(&mut self, oid: ObjectId, object_type: ObjectType, data: Vec<u8>) {
-            self.meta.insert(
-                oid,
-                ObjectMeta {
-                    object_type,
-                    size: data.len() as u64,
-                    pack_inflated_size: data.len() as u64,
-                    pack_offset: 0,
-                    compressed_start: 0,
-                    compressed_len: 0,
-                    crc32: 0,
-                    delta_base: None,
-                },
-            );
             self.objects.insert(
                 oid,
                 ObjectBytes {
@@ -609,17 +616,6 @@ mod tests {
     }
 
     impl ObjectReader for FakeObjectReader {
-        fn read_meta(&self, oid: ObjectId) -> Result<ObjectMeta, CloneError> {
-            self.meta
-                .get(&oid)
-                .cloned()
-                .ok_or_else(|| CloneError::ObjectLookupFailed {
-                    oid: oid.to_hex(),
-                    expected_type: "object",
-                    detail: "fake reader did not contain object metadata".to_owned(),
-                })
-        }
-
         fn read_object(&self, oid: ObjectId) -> Result<ObjectBytes, CloneError> {
             self.objects
                 .get(&oid)
@@ -796,6 +792,21 @@ mod tests {
         .expect("directories should be created parent first");
 
         assert!(temp.path().join("a/b").is_dir());
+    }
+
+    #[test]
+    fn checkout_chunk_size_should_handle_empty_manifests() {
+        assert_eq!(checkout_chunk_size(0, 8), 1);
+    }
+
+    #[test]
+    fn checkout_chunk_size_should_keep_small_manifests_fine_grained() {
+        assert_eq!(checkout_chunk_size(3, 8), 1);
+    }
+
+    #[test]
+    fn checkout_chunk_size_should_batch_large_manifests() {
+        assert_eq!(checkout_chunk_size(10_000, 8), 100);
     }
 
     fn test_repo(root: &Path) -> RepoLayout {

@@ -130,6 +130,7 @@ fn clone_repo_sequential(
     );
     let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
     let remote = remote?;
+    let remote_features = remote.advertised_clone_features();
     let refs = remote.refs.select_full_clone_universe();
     let ref_count = refs.len();
     let default_branch = resolve_default_branch(remote.refs.default_branch.as_deref(), &refs)?;
@@ -274,6 +275,7 @@ fn clone_repo_sequential(
 
     Ok(CloneReport {
         compression_backend: compression_backend(),
+        remote_features,
         ref_count,
         pack_bytes,
         total_ms,
@@ -353,6 +355,7 @@ fn clone_repo_pipelined(
     );
     let (remote, discovery_ms) = measure_ms(|| discover_remote(&client, &request.url));
     let remote = remote?;
+    let remote_features = remote.advertised_clone_features();
     let refs = remote.refs.select_full_clone_universe();
     let ref_count = refs.len();
     let default_branch = resolve_default_branch(remote.refs.default_branch.as_deref(), &refs)?;
@@ -517,6 +520,7 @@ fn clone_repo_pipelined(
 
     Ok(CloneReport {
         compression_backend: compression_backend(),
+        remote_features,
         ref_count,
         pack_bytes,
         total_ms,
