@@ -21,11 +21,22 @@ use crate::repo::{FinalizingRepo, RepoLayout};
 pub struct CloneRequest {
     pub url: String,
     pub target: Option<PathBuf>,
+    pub pipeline: bool,
 }
 
 impl CloneRequest {
     pub const fn new(url: String, target: Option<PathBuf>) -> Self {
-        Self { url, target }
+        Self {
+            url,
+            target,
+            pipeline: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_pipeline(mut self, pipeline: bool) -> Self {
+        self.pipeline = pipeline;
+        self
     }
 }
 
@@ -63,7 +74,8 @@ fn clone_repo_inner(
     progress: Option<&dyn Fn(CloneProgressEvent)>,
 ) -> Result<CloneReport, CloneError> {
     emit_progress(progress, CloneProgressEvent::Started);
-    if env_bool("FCL_PIPELINE") {
+    let use_pipeline = pipeline_enabled_for_request(&request);
+    if use_pipeline {
         let result = clone_repo_pipelined(request, progress);
         if result.is_ok() {
             emit_progress(progress, CloneProgressEvent::Completed);
@@ -76,6 +88,22 @@ fn clone_repo_inner(
         }
         result
     }
+}
+
+fn pipeline_enabled_for_request(request: &CloneRequest) -> bool {
+    pipeline_enabled(
+        request.pipeline,
+        env_bool("FCL_PIPELINE"),
+        env_bool("FCL_DISABLE_PIPELINE"),
+    )
+}
+
+const fn pipeline_enabled(
+    request_pipeline: bool,
+    force_pipeline: bool,
+    disable_pipeline: bool,
+) -> bool {
+    (request_pipeline || force_pipeline) && !disable_pipeline
 }
 
 fn emit_progress(progress: Option<&dyn Fn(CloneProgressEvent)>, event: CloneProgressEvent) {
@@ -194,6 +222,12 @@ fn clone_repo_sequential(
     let checkout_spilled_blob_count = ingest_report.checkout_spilled_blob_count;
     let checkout_spilled_blob_bytes = ingest_report.checkout_spilled_blob_bytes;
     let checkout_missing_blob_count = ingest_report.checkout_missing_blob_count;
+    let pack_object_count = ingest_report.object_count;
+    let pack_base_object_count = ingest_report.base_object_count;
+    let pack_delta_count = ingest_report.delta_count;
+    let pack_offset_delta_count = ingest_report.offset_delta_count;
+    let pack_ref_delta_count = ingest_report.ref_delta_count;
+    let pack_declared_inflated_bytes = ingest_report.declared_inflated_bytes;
     repo.write_initial_metadata(&remote, &refs, &default_branch.name)?;
     enforce_target_size_limit(max_temp_bytes, repo, "checking target size after ingest")?;
     emit_progress(
@@ -208,13 +242,17 @@ fn clone_repo_sequential(
         CloneProgressEvent::PhaseCompleted(CloneProgressPhase::CheckingOut),
     );
     let reconstructed_object_count = pack_index.reconstructed_object_count();
-    let total_ms = start.elapsed().as_millis();
     emit_progress(
         progress,
         CloneProgressEvent::PhaseStarted(CloneProgressPhase::Finalizing),
     );
+    let reported_before_finalize_ms = start.elapsed().as_millis();
+    let finalize_start = Instant::now();
     let repo = staged_repo.commit()?;
+    let publish_ms = finalize_start.elapsed().as_millis();
+    let target_size_start = Instant::now();
     let target_bytes = directory_bytes(repo.root())?;
+    let target_size_scan_ms = target_size_start.elapsed().as_millis();
     let rss_bytes = rss_bytes();
     enforce_optional_max_bytes(
         "FCL_MAX_TEMP_BYTES",
@@ -226,19 +264,40 @@ fn clone_repo_sequential(
         progress,
         CloneProgressEvent::PhaseCompleted(CloneProgressPhase::Finalizing),
     );
+    let finalize_ms = finalize_start.elapsed().as_millis().max(publish_ms);
+    let total_ms = start.elapsed().as_millis();
+    let clone_wall_ms = total_ms;
+    let clone_unreported_ms = clone_wall_ms.saturating_sub(reported_before_finalize_ms);
+    let pack_receive_bytes_per_sec = bytes_per_second(pack_bytes, fetch_ms);
 
     Ok(CloneReport {
         compression_backend: compression_backend(),
         ref_count,
         pack_bytes,
         total_ms,
+        clone_wall_ms,
+        clone_unreported_ms,
         discovery_ms,
         fetch_ms,
+        fetch_request_ms: fetched_pack.timings.request_ms,
+        fetch_first_byte_ms: fetched_pack.timings.first_byte_ms,
+        fetch_sideband_read_ms: fetched_pack.timings.sideband_read_ms,
+        fetch_pack_write_ms: fetched_pack.timings.pack_write_ms,
+        fetch_pack_flush_ms: fetched_pack.timings.pack_flush_ms,
+        fetch_checksum_ms: fetched_pack.timings.checksum_ms,
+        fetch_frame_send_wait_ms: None,
+        pack_receive_bytes_per_sec,
         ingest_ms,
         pack_scan_ms,
         pack_resolve_ms,
         pack_idx_write_ms,
         pack_object_state_ms,
+        pack_object_count,
+        pack_base_object_count,
+        pack_delta_count,
+        pack_offset_delta_count,
+        pack_ref_delta_count,
+        pack_declared_inflated_bytes,
         streaming_pack_scan,
         checkout_ms,
         checkout_manifest_ms: checkout.manifest_ms,
@@ -262,8 +321,15 @@ fn clone_repo_sequential(
         pipeline_enabled: false,
         pipeline_frame_count: None,
         pipeline_checkout_wait_ms: None,
+        pipeline_checkout_wait_count: None,
+        pipeline_checkout_wait_max_ms: None,
         pipeline_peak_pending_delta_count: None,
+        pipeline_resolver_wall_ms: None,
+        pipeline_resolver_wait_for_frame_ms: None,
+        pipeline_queue_peak_depth: None,
         pipeline_arena_spill_bytes: None,
+        finalize_ms,
+        target_size_scan_ms,
         target_bytes,
         rss_bytes,
     })
@@ -340,7 +406,7 @@ fn clone_repo_pipelined(
         let result = ingest_pack_pipeline(
             &resolver_pack_path,
             &resolver_index_path,
-            receiver,
+            &receiver,
             resolver_store.clone(),
         );
         if let Err(error) = &result {
@@ -357,14 +423,30 @@ fn clone_repo_pipelined(
     let checkout_result = materialize_default_branch(repo, &store, default_commit);
     let checkout_ms = checkout_start.elapsed().as_millis();
 
-    let fetch_joined = fetch_thread
+    let fetch_result = fetch_thread
         .join()
         .map_err(|_| CloneError::RemoteDiscoveryFailed {
             url: remote.url.clone(),
             operation: "joining pipeline fetch thread",
             detail: "fetch thread panicked".to_owned(),
-        })?;
-    let (fetched_pack, fetch_ms) = fetch_joined?;
+        })
+        .and_then(|result| result);
+    let resolver_result = resolver_thread
+        .join()
+        .map_err(|_| CloneError::PackIndexFailed {
+            path: pack_path.clone(),
+            operation: "joining pipeline resolver thread",
+            detail: "resolver thread panicked".to_owned(),
+        })
+        .and_then(|result| result);
+    let (fetched_pack, fetch_ms, ingest_report) = match (fetch_result, resolver_result) {
+        (Ok((fetched_pack, fetch_ms)), Ok(ingest_report)) => {
+            (fetched_pack, fetch_ms, ingest_report)
+        }
+        (Err(_fetch_error), Err(resolver_error)) => return Err(resolver_error),
+        (Err(fetch_error), Ok(_)) => return Err(fetch_error),
+        (Ok(_), Err(resolver_error)) => return Err(resolver_error),
+    };
     emit_progress(
         progress,
         CloneProgressEvent::PhaseCompleted(CloneProgressPhase::FetchingPack),
@@ -377,13 +459,6 @@ fn clone_repo_pipelined(
         "checking fetched pack size",
     )?;
 
-    let ingest_report = resolver_thread
-        .join()
-        .map_err(|_| CloneError::PackIndexFailed {
-            path: pack_path.clone(),
-            operation: "joining pipeline resolver thread",
-            detail: "resolver thread panicked".to_owned(),
-        })??;
     emit_progress(
         progress,
         CloneProgressEvent::PhaseCompleted(CloneProgressPhase::IndexingObjects),
@@ -404,9 +479,13 @@ fn clone_repo_pipelined(
         "checking target size after pipeline clone",
     )?;
     let reconstructed_object_count = pack_index.reconstructed_object_count();
-    let total_ms = start.elapsed().as_millis();
+    let reported_before_finalize_ms = start.elapsed().as_millis();
+    let finalize_start = Instant::now();
     let repo = staged_repo.commit()?;
+    let publish_ms = finalize_start.elapsed().as_millis();
+    let target_size_start = Instant::now();
     let target_bytes = directory_bytes(repo.root())?;
+    let target_size_scan_ms = target_size_start.elapsed().as_millis();
     let rss_bytes = rss_bytes();
     enforce_optional_max_bytes(
         "FCL_MAX_TEMP_BYTES",
@@ -418,14 +497,29 @@ fn clone_repo_pipelined(
         progress,
         CloneProgressEvent::PhaseCompleted(CloneProgressPhase::Finalizing),
     );
+    let finalize_ms = finalize_start.elapsed().as_millis().max(publish_ms);
+    let total_ms = start.elapsed().as_millis();
+    let clone_wall_ms = total_ms;
+    let clone_unreported_ms = clone_wall_ms.saturating_sub(reported_before_finalize_ms);
+    let pack_receive_bytes_per_sec = bytes_per_second(pack_bytes, fetch_ms);
 
     Ok(CloneReport {
         compression_backend: compression_backend(),
         ref_count,
         pack_bytes,
         total_ms,
+        clone_wall_ms,
+        clone_unreported_ms,
         discovery_ms,
         fetch_ms,
+        fetch_request_ms: fetched_pack.timings.request_ms,
+        fetch_first_byte_ms: fetched_pack.timings.first_byte_ms,
+        fetch_sideband_read_ms: fetched_pack.timings.sideband_read_ms,
+        fetch_pack_write_ms: fetched_pack.timings.pack_write_ms,
+        fetch_pack_flush_ms: fetched_pack.timings.pack_flush_ms,
+        fetch_checksum_ms: fetched_pack.timings.checksum_ms,
+        fetch_frame_send_wait_ms: Some(fetched_pack.timings.frame_send_wait_ms),
+        pack_receive_bytes_per_sec,
         ingest_ms: ingest_report.resolve_ms
             + ingest_report.idx_write_ms
             + ingest_report.object_state_ms,
@@ -433,6 +527,12 @@ fn clone_repo_pipelined(
         pack_resolve_ms: ingest_report.resolve_ms,
         pack_idx_write_ms: ingest_report.idx_write_ms,
         pack_object_state_ms: ingest_report.object_state_ms,
+        pack_object_count: ingest_report.object_count,
+        pack_base_object_count: ingest_report.base_object_count,
+        pack_delta_count: ingest_report.delta_count,
+        pack_offset_delta_count: ingest_report.offset_delta_count,
+        pack_ref_delta_count: ingest_report.ref_delta_count,
+        pack_declared_inflated_bytes: ingest_report.declared_inflated_bytes,
         streaming_pack_scan: true,
         checkout_ms,
         checkout_manifest_ms: checkout.manifest_ms,
@@ -456,11 +556,26 @@ fn clone_repo_pipelined(
         pipeline_enabled: true,
         pipeline_frame_count: ingest_report.pipeline_frame_count,
         pipeline_checkout_wait_ms: ingest_report.pipeline_checkout_wait_ms,
+        pipeline_checkout_wait_count: ingest_report.pipeline_checkout_wait_count,
+        pipeline_checkout_wait_max_ms: ingest_report.pipeline_checkout_wait_max_ms,
         pipeline_peak_pending_delta_count: ingest_report.pipeline_peak_pending_delta_count,
+        pipeline_resolver_wall_ms: ingest_report.pipeline_resolver_wall_ms,
+        pipeline_resolver_wait_for_frame_ms: ingest_report.pipeline_resolver_wait_for_frame_ms,
+        pipeline_queue_peak_depth: ingest_report.pipeline_queue_peak_depth,
         pipeline_arena_spill_bytes: ingest_report.pipeline_arena_spill_bytes,
+        finalize_ms,
+        target_size_scan_ms,
         target_bytes,
         rss_bytes,
     })
+}
+
+fn bytes_per_second(bytes: u64, ms: u128) -> u64 {
+    if ms == 0 {
+        return 0;
+    }
+    let bytes_per_second = u128::from(bytes).saturating_mul(1000) / ms;
+    u64::try_from(bytes_per_second).unwrap_or(u64::MAX)
 }
 
 fn pipeline_queue_capacity() -> usize {
@@ -592,4 +707,35 @@ fn default_target_dir(raw_url: &str) -> Result<PathBuf, CloneError> {
         });
     }
     Ok(PathBuf::from(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CloneRequest, pipeline_enabled};
+
+    #[test]
+    fn clone_request_should_enable_pipeline_by_default() {
+        let request = CloneRequest::new("https://example.com/repo.git".to_owned(), None);
+
+        assert!(request.pipeline);
+    }
+
+    #[test]
+    fn clone_request_should_allow_disabling_pipeline() {
+        let request =
+            CloneRequest::new("https://example.com/repo.git".to_owned(), None).with_pipeline(false);
+
+        assert!(!request.pipeline);
+    }
+
+    #[test]
+    fn pipeline_dispatch_should_use_pipeline_by_default() {
+        assert!(pipeline_enabled(true, false, false));
+    }
+
+    #[test]
+    fn pipeline_dispatch_should_allow_env_force_and_disable() {
+        assert!(pipeline_enabled(false, true, false));
+        assert!(!pipeline_enabled(true, true, true));
+    }
 }

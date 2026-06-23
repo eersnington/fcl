@@ -48,6 +48,7 @@ pub struct Remote {
     pub url: String,
     pub upload_pack_url: String,
     pub refs: RemoteRefs,
+    pub capabilities: Vec<String>,
 }
 
 pub struct FetchedPack {
@@ -55,6 +56,22 @@ pub struct FetchedPack {
     pub checksum: [u8; 20],
     pub scan: Option<PackScan>,
     pub scan_ms: u128,
+    pub timings: FetchTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "fetch timing fields keep the ms suffix to match CloneReport and CLI columns"
+)]
+pub struct FetchTimings {
+    pub request_ms: u128,
+    pub first_byte_ms: u128,
+    pub sideband_read_ms: u128,
+    pub pack_write_ms: u128,
+    pub pack_flush_ms: u128,
+    pub checksum_ms: u128,
+    pub frame_send_wait_ms: u128,
 }
 
 pub fn http_client() -> Result<Client, CloneError> {
@@ -108,6 +125,7 @@ pub fn discover_remote(client: &Client, raw_url: &str) -> Result<Remote, CloneEr
         url: raw_url.to_owned(),
         upload_pack_url: endpoints.upload_pack_url,
         refs,
+        capabilities,
     })
 }
 
@@ -118,8 +136,9 @@ pub fn fetch_full_pack(
     pack_path: &Path,
     progress: Option<&dyn Fn(u64)>,
 ) -> Result<FetchedPack, CloneError> {
-    let body = fetch_body(refs);
+    let body = fetch_body(remote, refs);
 
+    let request_start = Instant::now();
     let mut response = with_retries(|| {
         client
             .post(&remote.upload_pack_url)
@@ -132,6 +151,7 @@ pub fn fetch_full_pack(
                 detail: error.to_string(),
             })
     })?;
+    let request_ms = request_start.elapsed().as_millis();
 
     if !response.status().is_success() {
         return Err(CloneError::RemoteDiscoveryFailed {
@@ -149,12 +169,15 @@ pub fn fetch_full_pack(
         env_usize("FCL_PACK_WRITE_BUFFER", DEFAULT_PACK_WRITE_BUFFER),
         file,
     );
-    let fetched_pack =
+    let mut fetched_pack =
         write_sideband_pack(&remote.url, pack_path, &mut response, &mut file, progress)?;
+    fetched_pack.timings.request_ms = request_ms;
+    let flush_start = Instant::now();
     file.flush().map_err(|source| CloneError::PackWriteFailed {
         path: pack_path.to_owned(),
         source,
     })?;
+    fetched_pack.timings.pack_flush_ms += flush_start.elapsed().as_millis();
     Ok(fetched_pack)
 }
 
@@ -166,7 +189,8 @@ pub fn fetch_full_pack_pipelined(
     sender: &SyncSender<PipelineEvent>,
     progress: Option<&dyn Fn(u64)>,
 ) -> Result<FetchedPack, CloneError> {
-    let body = fetch_body(refs);
+    let body = fetch_body(remote, refs);
+    let request_start = Instant::now();
     let mut response = with_retries(|| {
         client
             .post(&remote.upload_pack_url)
@@ -179,6 +203,7 @@ pub fn fetch_full_pack_pipelined(
                 detail: error.to_string(),
             })
     })?;
+    let request_ms = request_start.elapsed().as_millis();
 
     if !response.status().is_success() {
         return Err(CloneError::RemoteDiscoveryFailed {
@@ -196,7 +221,7 @@ pub fn fetch_full_pack_pipelined(
         env_usize("FCL_PACK_WRITE_BUFFER", DEFAULT_PACK_WRITE_BUFFER),
         file,
     );
-    let fetched_pack = write_sideband_pack_pipelined(
+    let mut fetched_pack = write_sideband_pack_pipelined(
         &remote.url,
         pack_path,
         &mut response,
@@ -204,19 +229,37 @@ pub fn fetch_full_pack_pipelined(
         sender,
         progress,
     )?;
+    fetched_pack.timings.request_ms = request_ms;
+    let flush_start = Instant::now();
     file.flush().map_err(|source| CloneError::PackWriteFailed {
         path: pack_path.to_owned(),
         source,
     })?;
+    fetched_pack.timings.pack_flush_ms += flush_start.elapsed().as_millis();
     Ok(fetched_pack)
 }
 
-fn fetch_body(refs: &[RemoteRef]) -> Vec<u8> {
+fn fetch_body(remote: &Remote, refs: &[RemoteRef]) -> Vec<u8> {
+    fetch_body_with_remote_progress(
+        refs,
+        env_bool("FCL_REMOTE_PROGRESS") && remote.advertises_fetch_command(),
+    )
+}
+
+impl Remote {
+    fn advertises_fetch_command(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability.trim_end().starts_with("fetch"))
+    }
+}
+
+fn fetch_body_with_remote_progress(refs: &[RemoteRef], remote_progress: bool) -> Vec<u8> {
     let mut body = Vec::new();
     encode_data("command=fetch\n", &mut body);
     encode_data("agent=fcl/0.1\n", &mut body);
     encode_delimiter(&mut body);
-    if env_bool("FCL_NO_PROGRESS") {
+    if !remote_progress {
         encode_data("no-progress\n", &mut body);
     }
     encode_data("thin-pack\n", &mut body);
@@ -406,9 +449,15 @@ fn write_sideband_pack(
     let max_pack_bytes = optional_u64_env("FCL_MAX_PACK_BYTES")?;
     let mut scanner = env_bool("FCL_STREAM_SCAN").then(|| StreamingPackScanner::new(pack_path));
     let mut scan_duration = Duration::ZERO;
+    let mut timings = FetchTimings::default();
+    let mut packet_reader = PacketReader::new();
+    let receive_start = Instant::now();
+    let mut saw_pack_data = false;
 
     loop {
-        let packet = read_packet(raw_url, response)?;
+        let read_start = Instant::now();
+        let packet = packet_reader.read_packet(raw_url, response)?;
+        timings.sideband_read_ms += read_start.elapsed().as_millis();
         let Some(data) = packet else {
             break;
         };
@@ -420,11 +469,17 @@ fn write_sideband_pack(
         };
         match *band {
             1 => {
+                if !saw_pack_data {
+                    timings.first_byte_ms = receive_start.elapsed().as_millis();
+                    saw_pack_data = true;
+                }
+                let write_start = Instant::now();
                 file.write_all(payload)
                     .map_err(|source| CloneError::PackWriteFailed {
                         path: pack_path.to_owned(),
                         source,
                     })?;
+                timings.pack_write_ms += write_start.elapsed().as_millis();
                 pack_bytes += payload.len() as u64;
                 emit_pack_progress(progress, pack_bytes, &mut next_progress_bytes);
                 enforce_max_pack_bytes(max_pack_bytes, pack_bytes)?;
@@ -453,7 +508,9 @@ fn write_sideband_pack(
         }
     }
 
+    let checksum_start = Instant::now();
     let checksum = validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    timings.checksum_ms = checksum_start.elapsed().as_millis();
     if let Some(progress) = progress {
         progress(pack_bytes);
     }
@@ -466,9 +523,14 @@ fn write_sideband_pack(
         checksum,
         scan,
         scan_ms: scan_duration.as_millis(),
+        timings,
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "sideband receive, pack write, scan, and pipeline event emission share one tight loop"
+)]
 fn write_sideband_pack_pipelined(
     raw_url: &str,
     pack_path: &Path,
@@ -483,9 +545,15 @@ fn write_sideband_pack_pipelined(
     let max_pack_bytes = optional_u64_env("FCL_MAX_PACK_BYTES")?;
     let mut scanner = StreamingPackScanner::with_payload(pack_path, ScanPayload::Inflate);
     let mut scan_duration = Duration::ZERO;
+    let mut timings = FetchTimings::default();
+    let mut packet_reader = PacketReader::new();
+    let receive_start = Instant::now();
+    let mut saw_pack_data = false;
 
     loop {
-        let packet = read_packet(raw_url, response)?;
+        let read_start = Instant::now();
+        let packet = packet_reader.read_packet(raw_url, response)?;
+        timings.sideband_read_ms += read_start.elapsed().as_millis();
         let Some(data) = packet else {
             break;
         };
@@ -497,11 +565,17 @@ fn write_sideband_pack_pipelined(
         };
         match *band {
             1 => {
+                if !saw_pack_data {
+                    timings.first_byte_ms = receive_start.elapsed().as_millis();
+                    saw_pack_data = true;
+                }
+                let write_start = Instant::now();
                 file.write_all(payload)
                     .map_err(|source| CloneError::PackWriteFailed {
                         path: pack_path.to_owned(),
                         source,
                     })?;
+                timings.pack_write_ms += write_start.elapsed().as_millis();
                 pack_bytes += payload.len() as u64;
                 emit_pack_progress(progress, pack_bytes, &mut next_progress_bytes);
                 enforce_max_pack_bytes(max_pack_bytes, pack_bytes)?;
@@ -509,14 +583,16 @@ fn write_sideband_pack_pipelined(
                 let scan_start = Instant::now();
                 let frames = scanner.feed_collect(payload)?;
                 scan_duration += scan_start.elapsed();
-                for frame in frames {
-                    sender.send(PipelineEvent::Frame(frame)).map_err(|error| {
-                        CloneError::PackIndexFailed {
+                if !frames.is_empty() {
+                    let send_start = Instant::now();
+                    sender
+                        .send(PipelineEvent::Frames(frames))
+                        .map_err(|error| CloneError::PackIndexFailed {
                             path: pack_path.to_owned(),
-                            operation: "sending pipeline object frame",
+                            operation: "sending pipeline object frames",
                             detail: error.to_string(),
-                        }
-                    })?;
+                        })?;
+                    timings.frame_send_wait_ms += send_start.elapsed().as_millis();
                 }
             }
             2 => {}
@@ -537,12 +613,21 @@ fn write_sideband_pack_pipelined(
         }
     }
 
+    let checksum_start = Instant::now();
     let checksum = validate_streaming_pack_checksum(raw_url, pack_path, pack_bytes, hasher)?;
+    timings.checksum_ms = checksum_start.elapsed().as_millis();
     if let Some(progress) = progress {
         progress(pack_bytes);
     }
     scanner.finish(checksum)?;
     let scan_ms = scan_duration.as_millis();
+    let flush_start = Instant::now();
+    file.flush().map_err(|source| CloneError::PackWriteFailed {
+        path: pack_path.to_owned(),
+        source,
+    })?;
+    timings.pack_flush_ms += flush_start.elapsed().as_millis();
+    let send_start = Instant::now();
     sender
         .send(PipelineEvent::Finished {
             checksum,
@@ -554,12 +639,14 @@ fn write_sideband_pack_pipelined(
             operation: "sending pipeline completion",
             detail: error.to_string(),
         })?;
+    timings.frame_send_wait_ms += send_start.elapsed().as_millis();
 
     Ok(FetchedPack {
         bytes: pack_bytes,
         checksum,
         scan: None,
         scan_ms,
+        timings,
     })
 }
 
@@ -576,51 +663,67 @@ fn emit_pack_progress(
     }
 }
 
-fn read_packet(raw_url: &str, reader: &mut impl Read) -> Result<Option<Vec<u8>>, CloneError> {
-    let mut header = [0u8; 4];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => {
-            return Err(CloneError::RemoteDiscoveryFailed {
+struct PacketReader {
+    data: Vec<u8>,
+}
+
+impl PacketReader {
+    const fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    fn read_packet<'a>(
+        &'a mut self,
+        raw_url: &str,
+        reader: &mut impl Read,
+    ) -> Result<Option<&'a [u8]>, CloneError> {
+        let mut header = [0u8; 4];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => {
+                return Err(CloneError::RemoteDiscoveryFailed {
+                    url: raw_url.to_owned(),
+                    operation: "reading pack response pkt-line header",
+                    detail: error.to_string(),
+                });
+            }
+        }
+        let header =
+            std::str::from_utf8(&header).map_err(|error| CloneError::MalformedRemoteResponse {
                 url: raw_url.to_owned(),
-                operation: "reading pack response pkt-line header",
-                detail: error.to_string(),
+                operation: "parsing pack sideband response",
+                detail: format!("pkt-line header was not UTF-8 hex: {error}"),
+            })?;
+        match header {
+            "0000" | "0001" | "0002" => return Ok(None),
+            _ => {}
+        }
+        let len = usize::from_str_radix(header, 16).map_err(|error| {
+            CloneError::MalformedRemoteResponse {
+                url: raw_url.to_owned(),
+                operation: "parsing pack sideband response",
+                detail: format!("pkt-line length `{header}` was invalid: {error}"),
+            }
+        })?;
+        if len < 4 {
+            return Err(CloneError::MalformedRemoteResponse {
+                url: raw_url.to_owned(),
+                operation: "parsing pack sideband response",
+                detail: format!("pkt-line length `{len}` is smaller than its header"),
             });
         }
+        self.data.clear();
+        self.data.resize(len - 4, 0);
+        reader
+            .read_exact(&mut self.data)
+            .map_err(|error| CloneError::RemoteDiscoveryFailed {
+                url: raw_url.to_owned(),
+                operation: "reading pack response pkt-line payload",
+                detail: error.to_string(),
+            })?;
+        Ok(Some(&self.data))
     }
-    let header =
-        std::str::from_utf8(&header).map_err(|error| CloneError::MalformedRemoteResponse {
-            url: raw_url.to_owned(),
-            operation: "parsing pack sideband response",
-            detail: format!("pkt-line header was not UTF-8 hex: {error}"),
-        })?;
-    match header {
-        "0000" | "0001" | "0002" => return Ok(None),
-        _ => {}
-    }
-    let len =
-        usize::from_str_radix(header, 16).map_err(|error| CloneError::MalformedRemoteResponse {
-            url: raw_url.to_owned(),
-            operation: "parsing pack sideband response",
-            detail: format!("pkt-line length `{header}` was invalid: {error}"),
-        })?;
-    if len < 4 {
-        return Err(CloneError::MalformedRemoteResponse {
-            url: raw_url.to_owned(),
-            operation: "parsing pack sideband response",
-            detail: format!("pkt-line length `{len}` is smaller than its header"),
-        });
-    }
-    let mut data = vec![0u8; len - 4];
-    reader
-        .read_exact(&mut data)
-        .map_err(|error| CloneError::RemoteDiscoveryFailed {
-            url: raw_url.to_owned(),
-            operation: "reading pack response pkt-line payload",
-            detail: error.to_string(),
-        })?;
-    Ok(Some(data))
 }
 
 struct PackTrailerHasher {
@@ -831,4 +934,58 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PacketReader, RemoteRef, fetch_body_with_remote_progress};
+
+    #[test]
+    fn fetch_body_should_request_no_progress_by_default() {
+        let refs = [RemoteRef {
+            oid: "0123456789012345678901234567890123456789".to_owned(),
+            name: "refs/heads/main".to_owned(),
+        }];
+
+        let body = fetch_body_with_remote_progress(&refs, false);
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(body.contains("no-progress\n"));
+    }
+
+    #[test]
+    fn fetch_body_should_allow_remote_progress_for_debugging() {
+        let refs = [RemoteRef {
+            oid: "0123456789012345678901234567890123456789".to_owned(),
+            name: "refs/heads/main".to_owned(),
+        }];
+
+        let body = fetch_body_with_remote_progress(&refs, true);
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(!body.contains("no-progress\n"));
+    }
+
+    #[test]
+    fn packet_reader_should_reuse_scratch_buffer() {
+        let mut reader = PacketReader::new();
+        let mut input = b"0009abcd\n0008efg\n0000".as_slice();
+
+        let first = reader
+            .read_packet("https://example.com/repo.git", &mut input)
+            .expect("first packet should parse")
+            .expect("first packet should exist")
+            .as_ptr();
+        let second = reader
+            .read_packet("https://example.com/repo.git", &mut input)
+            .expect("second packet should parse")
+            .expect("second packet should exist")
+            .as_ptr();
+        let end = reader
+            .read_packet("https://example.com/repo.git", &mut input)
+            .expect("flush should parse");
+
+        assert_eq!(first, second);
+        assert!(end.is_none());
+    }
 }

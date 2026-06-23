@@ -34,7 +34,17 @@ pub struct BenchCli {
     pub validate: bool,
 
     #[command(flatten)]
+    pub pipeline: BenchPipeline,
+
+    #[command(flatten)]
     pub output: BenchOutput,
+}
+
+#[derive(Debug, Parser)]
+pub struct BenchPipeline {
+    /// Disable the default streaming pipeline for fcl benchmark runs.
+    #[arg(long)]
+    pub no_pipeline: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -61,13 +71,29 @@ struct BenchResult {
     compression_backend: &'static str,
     run: usize,
     total_ms: u128,
+    clone_wall_ms: Option<u128>,
+    clone_unreported_ms: Option<u128>,
     discovery_ms: Option<u128>,
     fetch_ms: Option<u128>,
+    fetch_request_ms: Option<u128>,
+    fetch_first_byte_ms: Option<u128>,
+    fetch_sideband_read_ms: Option<u128>,
+    fetch_pack_write_ms: Option<u128>,
+    fetch_pack_flush_ms: Option<u128>,
+    fetch_checksum_ms: Option<u128>,
+    fetch_frame_send_wait_ms: Option<u128>,
+    pack_receive_bytes_per_sec: Option<u64>,
     ingest_ms: Option<u128>,
     pack_scan_ms: Option<u128>,
     pack_resolve_ms: Option<u128>,
     pack_idx_write_ms: Option<u128>,
     pack_object_state_ms: Option<u128>,
+    pack_object_count: Option<usize>,
+    pack_base_object_count: Option<usize>,
+    pack_delta_count: Option<usize>,
+    pack_offset_delta_count: Option<usize>,
+    pack_ref_delta_count: Option<usize>,
+    pack_declared_inflated_bytes: Option<u64>,
     streaming_pack_scan: Option<bool>,
     checkout_ms: Option<u128>,
     checkout_manifest_ms: Option<u128>,
@@ -93,8 +119,15 @@ struct BenchResult {
     pipeline_enabled: bool,
     pipeline_frame_count: Option<usize>,
     pipeline_checkout_wait_ms: Option<u128>,
+    pipeline_checkout_wait_count: Option<usize>,
+    pipeline_checkout_wait_max_ms: Option<u128>,
     pipeline_peak_pending_delta_count: Option<usize>,
+    pipeline_resolver_wall_ms: Option<u128>,
+    pipeline_resolver_wait_for_frame_ms: Option<u128>,
+    pipeline_queue_peak_depth: Option<usize>,
     pipeline_arena_spill_bytes: Option<u64>,
+    finalize_ms: Option<u128>,
+    target_size_scan_ms: Option<u128>,
     target_bytes: Option<u64>,
     rss_bytes: Option<u64>,
     git_trace_path: Option<PathBuf>,
@@ -115,7 +148,7 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
 
     if cli.output.csv {
         println!(
-            "url,tool,compression_backend,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,checkout_needed_blob_count,checkout_ready_blob_count,checkout_ready_blob_bytes,checkout_spilled_blob_count,checkout_spilled_blob_bytes,checkout_missing_blob_count,reconstructed_object_count,pipeline_enabled,pipeline_frame_count,pipeline_checkout_wait_ms,pipeline_peak_pending_delta_count,pipeline_arena_spill_bytes,target_bytes,rss_bytes,git_trace_path,git_remote_ms,git_index_pack_ms,git_checkout_ms,git_trace_parse_error,validated"
+            "url,tool,compression_backend,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,checkout_needed_blob_count,checkout_ready_blob_count,checkout_ready_blob_bytes,checkout_spilled_blob_count,checkout_spilled_blob_bytes,checkout_missing_blob_count,reconstructed_object_count,pipeline_enabled,pipeline_frame_count,pipeline_checkout_wait_ms,pipeline_peak_pending_delta_count,pipeline_arena_spill_bytes,target_bytes,rss_bytes,git_trace_path,git_remote_ms,git_index_pack_ms,git_checkout_ms,git_trace_parse_error,clone_wall_ms,clone_unreported_ms,fetch_request_ms,fetch_first_byte_ms,fetch_sideband_read_ms,fetch_pack_write_ms,fetch_pack_flush_ms,fetch_checksum_ms,fetch_frame_send_wait_ms,pack_receive_bytes_per_sec,pack_object_count,pack_base_object_count,pack_delta_count,pack_offset_delta_count,pack_ref_delta_count,pack_declared_inflated_bytes,pipeline_checkout_wait_count,pipeline_checkout_wait_max_ms,pipeline_resolver_wall_ms,pipeline_resolver_wait_for_frame_ms,pipeline_queue_peak_depth,finalize_ms,target_size_scan_ms,validated"
         );
     }
 
@@ -152,7 +185,10 @@ fn run_fcl_bench(
 ) -> Result<(), CloneError> {
     let target = bench_target("fcl", run);
     remove_target(&target)?;
-    let report = clone_repo(CloneRequest::new(cli.url.clone(), Some(target.clone())))?;
+    let report = clone_repo(
+        CloneRequest::new(cli.url.clone(), Some(target.clone()))
+            .with_pipeline(!cli.pipeline.no_pipeline),
+    )?;
     if cli.validate {
         validate_repo(&target)?;
     }
@@ -194,13 +230,29 @@ fn run_git_bench(
         compression_backend: "git",
         run,
         total_ms,
+        clone_wall_ms: None,
+        clone_unreported_ms: None,
         discovery_ms: None,
         fetch_ms: None,
+        fetch_request_ms: None,
+        fetch_first_byte_ms: None,
+        fetch_sideband_read_ms: None,
+        fetch_pack_write_ms: None,
+        fetch_pack_flush_ms: None,
+        fetch_checksum_ms: None,
+        fetch_frame_send_wait_ms: None,
+        pack_receive_bytes_per_sec: None,
         ingest_ms: None,
         pack_scan_ms: None,
         pack_resolve_ms: None,
         pack_idx_write_ms: None,
         pack_object_state_ms: None,
+        pack_object_count: None,
+        pack_base_object_count: None,
+        pack_delta_count: None,
+        pack_offset_delta_count: None,
+        pack_ref_delta_count: None,
+        pack_declared_inflated_bytes: None,
         streaming_pack_scan: None,
         checkout_ms: None,
         checkout_manifest_ms: None,
@@ -226,8 +278,15 @@ fn run_git_bench(
         pipeline_enabled: false,
         pipeline_frame_count: None,
         pipeline_checkout_wait_ms: None,
+        pipeline_checkout_wait_count: None,
+        pipeline_checkout_wait_max_ms: None,
         pipeline_peak_pending_delta_count: None,
+        pipeline_resolver_wall_ms: None,
+        pipeline_resolver_wait_for_frame_ms: None,
+        pipeline_queue_peak_depth: None,
         pipeline_arena_spill_bytes: None,
+        finalize_ms: None,
+        target_size_scan_ms: None,
         target_bytes: target_size(&target).ok(),
         rss_bytes: None,
         git_trace_path: trace_path,
@@ -249,13 +308,29 @@ impl BenchResult {
             compression_backend: report.compression_backend,
             run,
             total_ms: report.total_ms,
+            clone_wall_ms: Some(report.clone_wall_ms),
+            clone_unreported_ms: Some(report.clone_unreported_ms),
             discovery_ms: Some(report.discovery_ms),
             fetch_ms: Some(report.fetch_ms),
+            fetch_request_ms: Some(report.fetch_request_ms),
+            fetch_first_byte_ms: Some(report.fetch_first_byte_ms),
+            fetch_sideband_read_ms: Some(report.fetch_sideband_read_ms),
+            fetch_pack_write_ms: Some(report.fetch_pack_write_ms),
+            fetch_pack_flush_ms: Some(report.fetch_pack_flush_ms),
+            fetch_checksum_ms: Some(report.fetch_checksum_ms),
+            fetch_frame_send_wait_ms: report.fetch_frame_send_wait_ms,
+            pack_receive_bytes_per_sec: Some(report.pack_receive_bytes_per_sec),
             ingest_ms: Some(report.ingest_ms),
             pack_scan_ms: Some(report.pack_scan_ms),
             pack_resolve_ms: Some(report.pack_resolve_ms),
             pack_idx_write_ms: Some(report.pack_idx_write_ms),
             pack_object_state_ms: Some(report.pack_object_state_ms),
+            pack_object_count: Some(report.pack_object_count),
+            pack_base_object_count: Some(report.pack_base_object_count),
+            pack_delta_count: Some(report.pack_delta_count),
+            pack_offset_delta_count: Some(report.pack_offset_delta_count),
+            pack_ref_delta_count: Some(report.pack_ref_delta_count),
+            pack_declared_inflated_bytes: Some(report.pack_declared_inflated_bytes),
             streaming_pack_scan: Some(report.streaming_pack_scan),
             checkout_ms: Some(report.checkout_ms),
             checkout_manifest_ms: Some(report.checkout_manifest_ms),
@@ -281,8 +356,15 @@ impl BenchResult {
             pipeline_enabled: report.pipeline_enabled,
             pipeline_frame_count: report.pipeline_frame_count,
             pipeline_checkout_wait_ms: report.pipeline_checkout_wait_ms,
+            pipeline_checkout_wait_count: report.pipeline_checkout_wait_count,
+            pipeline_checkout_wait_max_ms: report.pipeline_checkout_wait_max_ms,
             pipeline_peak_pending_delta_count: report.pipeline_peak_pending_delta_count,
+            pipeline_resolver_wall_ms: report.pipeline_resolver_wall_ms,
+            pipeline_resolver_wait_for_frame_ms: report.pipeline_resolver_wait_for_frame_ms,
+            pipeline_queue_peak_depth: report.pipeline_queue_peak_depth,
             pipeline_arena_spill_bytes: report.pipeline_arena_spill_bytes,
+            finalize_ms: Some(report.finalize_ms),
+            target_size_scan_ms: Some(report.target_size_scan_ms),
             target_bytes: Some(report.target_bytes),
             rss_bytes: report.rss_bytes,
             git_trace_path: None,
@@ -588,7 +670,7 @@ fn print_result(cli: &BenchCli, result: &BenchResult) {
 
 fn print_json_result(url: &str, result: &BenchResult) {
     println!(
-        "{{\"url\":\"{}\",\"tool\":\"{}\",\"compression_backend\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"checkout_needed_blob_count\":{},\"checkout_ready_blob_count\":{},\"checkout_ready_blob_bytes\":{},\"checkout_spilled_blob_count\":{},\"checkout_spilled_blob_bytes\":{},\"checkout_missing_blob_count\":{},\"reconstructed_object_count\":{},\"pipeline_enabled\":{},\"pipeline_frame_count\":{},\"pipeline_checkout_wait_ms\":{},\"pipeline_peak_pending_delta_count\":{},\"pipeline_arena_spill_bytes\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"git_remote_ms\":{},\"git_index_pack_ms\":{},\"git_checkout_ms\":{},\"git_trace_parse_error\":{},\"validated\":{}}}",
+        "{{\"url\":\"{}\",\"tool\":\"{}\",\"compression_backend\":\"{}\",\"run\":{},\"total_ms\":{},\"discovery_ms\":{},\"fetch_ms\":{},\"ingest_ms\":{},\"pack_scan_ms\":{},\"pack_resolve_ms\":{},\"pack_idx_write_ms\":{},\"pack_object_state_ms\":{},\"streaming_pack_scan\":{},\"checkout_ms\":{},\"checkout_manifest_ms\":{},\"checkout_dir_create_ms\":{},\"checkout_file_materialize_ms\":{},\"checkout_index_write_ms\":{},\"checkout_file_count\":{},\"checkout_dir_count\":{},\"checkout_blob_bytes\":{},\"pack_bytes\":{},\"ref_count\":{},\"retained_object_count\":{},\"retained_object_bytes\":{},\"spilled_object_count\":{},\"spilled_object_bytes\":{},\"checkout_needed_blob_count\":{},\"checkout_ready_blob_count\":{},\"checkout_ready_blob_bytes\":{},\"checkout_spilled_blob_count\":{},\"checkout_spilled_blob_bytes\":{},\"checkout_missing_blob_count\":{},\"reconstructed_object_count\":{},\"pipeline_enabled\":{},\"pipeline_frame_count\":{},\"pipeline_checkout_wait_ms\":{},\"pipeline_peak_pending_delta_count\":{},\"pipeline_arena_spill_bytes\":{},\"target_bytes\":{},\"rss_bytes\":{},\"git_trace_path\":{},\"git_remote_ms\":{},\"git_index_pack_ms\":{},\"git_checkout_ms\":{},\"git_trace_parse_error\":{},\"clone_wall_ms\":{},\"clone_unreported_ms\":{},\"fetch_request_ms\":{},\"fetch_first_byte_ms\":{},\"fetch_sideband_read_ms\":{},\"fetch_pack_write_ms\":{},\"fetch_pack_flush_ms\":{},\"fetch_checksum_ms\":{},\"fetch_frame_send_wait_ms\":{},\"pack_receive_bytes_per_sec\":{},\"pack_object_count\":{},\"pack_base_object_count\":{},\"pack_delta_count\":{},\"pack_offset_delta_count\":{},\"pack_ref_delta_count\":{},\"pack_declared_inflated_bytes\":{},\"pipeline_checkout_wait_count\":{},\"pipeline_checkout_wait_max_ms\":{},\"pipeline_resolver_wall_ms\":{},\"pipeline_resolver_wait_for_frame_ms\":{},\"pipeline_queue_peak_depth\":{},\"finalize_ms\":{},\"target_size_scan_ms\":{},\"validated\":{}}}",
         escape_json(url),
         result.tool,
         escape_json(result.compression_backend),
@@ -635,6 +717,29 @@ fn print_json_result(url: &str, result: &BenchResult) {
         option_u128(result.git_index_pack_ms),
         option_u128(result.git_checkout_ms),
         option_string(result.git_trace_parse_error.as_deref()),
+        option_u128(result.clone_wall_ms),
+        option_u128(result.clone_unreported_ms),
+        option_u128(result.fetch_request_ms),
+        option_u128(result.fetch_first_byte_ms),
+        option_u128(result.fetch_sideband_read_ms),
+        option_u128(result.fetch_pack_write_ms),
+        option_u128(result.fetch_pack_flush_ms),
+        option_u128(result.fetch_checksum_ms),
+        option_u128(result.fetch_frame_send_wait_ms),
+        option_u64(result.pack_receive_bytes_per_sec),
+        option_usize(result.pack_object_count),
+        option_usize(result.pack_base_object_count),
+        option_usize(result.pack_delta_count),
+        option_usize(result.pack_offset_delta_count),
+        option_usize(result.pack_ref_delta_count),
+        option_u64(result.pack_declared_inflated_bytes),
+        option_usize(result.pipeline_checkout_wait_count),
+        option_u128(result.pipeline_checkout_wait_max_ms),
+        option_u128(result.pipeline_resolver_wall_ms),
+        option_u128(result.pipeline_resolver_wait_for_frame_ms),
+        option_usize(result.pipeline_queue_peak_depth),
+        option_u128(result.finalize_ms),
+        option_u128(result.target_size_scan_ms),
         result.validated
     );
 }
@@ -687,6 +792,29 @@ fn print_csv_result(url: &str, result: &BenchResult) {
         csv_u128(result.git_index_pack_ms),
         csv_u128(result.git_checkout_ms),
         csv_string(result.git_trace_parse_error.as_deref()),
+        csv_u128(result.clone_wall_ms),
+        csv_u128(result.clone_unreported_ms),
+        csv_u128(result.fetch_request_ms),
+        csv_u128(result.fetch_first_byte_ms),
+        csv_u128(result.fetch_sideband_read_ms),
+        csv_u128(result.fetch_pack_write_ms),
+        csv_u128(result.fetch_pack_flush_ms),
+        csv_u128(result.fetch_checksum_ms),
+        csv_u128(result.fetch_frame_send_wait_ms),
+        csv_u64(result.pack_receive_bytes_per_sec),
+        csv_usize(result.pack_object_count),
+        csv_usize(result.pack_base_object_count),
+        csv_usize(result.pack_delta_count),
+        csv_usize(result.pack_offset_delta_count),
+        csv_usize(result.pack_ref_delta_count),
+        csv_u64(result.pack_declared_inflated_bytes),
+        csv_usize(result.pipeline_checkout_wait_count),
+        csv_u128(result.pipeline_checkout_wait_max_ms),
+        csv_u128(result.pipeline_resolver_wall_ms),
+        csv_u128(result.pipeline_resolver_wait_for_frame_ms),
+        csv_usize(result.pipeline_queue_peak_depth),
+        csv_u128(result.finalize_ms),
+        csv_u128(result.target_size_scan_ms),
         result.validated.to_string(),
     ];
     println!("{}", fields.join(","));
@@ -694,7 +822,7 @@ fn print_csv_result(url: &str, result: &BenchResult) {
 
 fn print_plain_result(result: &BenchResult) {
     println!(
-        "{} run {} backend={}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} checkout_needed_blobs={} checkout_ready_blobs={} checkout_ready_blob_bytes={} checkout_spilled_blobs={} checkout_spilled_blob_bytes={} checkout_missing_blobs={} reconstructed_objects={} pipeline_enabled={} pipeline_frames={} pipeline_checkout_wait={} pipeline_peak_pending_deltas={} pipeline_arena_spill_bytes={} target_bytes={} rss={} git_trace={} git_remote={} git_index_pack={} git_checkout={} git_trace_parse_error={} validated={}",
+        "{} run {} backend={}: total={}ms discovery={} fetch={} ingest={} pack_scan={} pack_resolve={} pack_idx_write={} pack_object_state={} streaming_pack_scan={} checkout={} checkout_manifest={} checkout_dirs={} checkout_files={} checkout_index={} checkout_file_count={} checkout_dir_count={} checkout_blob_bytes={} pack_bytes={} refs={} retained_objects={} retained_bytes={} spilled_objects={} spilled_bytes={} checkout_needed_blobs={} checkout_ready_blobs={} checkout_ready_blob_bytes={} checkout_spilled_blobs={} checkout_spilled_blob_bytes={} checkout_missing_blobs={} reconstructed_objects={} pipeline_enabled={} pipeline_frames={} pipeline_checkout_wait={} pipeline_peak_pending_deltas={} pipeline_arena_spill_bytes={} target_bytes={} rss={} git_trace={} git_remote={} git_index_pack={} git_checkout={} git_trace_parse_error={} clone_wall={} clone_unreported={} fetch_request={} fetch_first_byte={} fetch_sideband_read={} fetch_pack_write={} fetch_pack_flush={} fetch_checksum={} fetch_frame_send_wait={} pack_receive_bytes_per_sec={} pack_objects={} pack_bases={} pack_deltas={} pack_ofs_deltas={} pack_ref_deltas={} pack_declared_inflated_bytes={} pipeline_checkout_wait_count={} pipeline_checkout_wait_max={} pipeline_resolver_wall={} pipeline_resolver_wait_for_frame={} pipeline_queue_peak={} finalize={} target_size_scan={} validated={}",
         result.tool,
         result.run,
         result.compression_backend,
@@ -740,6 +868,29 @@ fn print_plain_result(result: &BenchResult) {
         ms_or_dash(result.git_index_pack_ms),
         ms_or_dash(result.git_checkout_ms),
         string_or_dash(result.git_trace_parse_error.as_deref()),
+        ms_or_dash(result.clone_wall_ms),
+        ms_or_dash(result.clone_unreported_ms),
+        ms_or_dash(result.fetch_request_ms),
+        ms_or_dash(result.fetch_first_byte_ms),
+        ms_or_dash(result.fetch_sideband_read_ms),
+        ms_or_dash(result.fetch_pack_write_ms),
+        ms_or_dash(result.fetch_pack_flush_ms),
+        ms_or_dash(result.fetch_checksum_ms),
+        ms_or_dash(result.fetch_frame_send_wait_ms),
+        u64_or_dash(result.pack_receive_bytes_per_sec),
+        usize_or_dash(result.pack_object_count),
+        usize_or_dash(result.pack_base_object_count),
+        usize_or_dash(result.pack_delta_count),
+        usize_or_dash(result.pack_offset_delta_count),
+        usize_or_dash(result.pack_ref_delta_count),
+        u64_or_dash(result.pack_declared_inflated_bytes),
+        usize_or_dash(result.pipeline_checkout_wait_count),
+        ms_or_dash(result.pipeline_checkout_wait_max_ms),
+        ms_or_dash(result.pipeline_resolver_wall_ms),
+        ms_or_dash(result.pipeline_resolver_wait_for_frame_ms),
+        usize_or_dash(result.pipeline_queue_peak_depth),
+        ms_or_dash(result.finalize_ms),
+        ms_or_dash(result.target_size_scan_ms),
         result.validated
     );
 }

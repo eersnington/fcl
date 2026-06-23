@@ -26,6 +26,10 @@ struct CloneCli {
     #[arg(long)]
     stats: bool,
 
+    /// Disable the default streaming pipeline and use the sequential clone path.
+    #[arg(long)]
+    no_pipeline: bool,
+
     /// Repository URL to clone.
     url: String,
 
@@ -79,7 +83,7 @@ fn main() {
         || "<default>".to_owned(),
         |target| target.display().to_string(),
     );
-    let request = CloneRequest::new(cli.url, cli.target);
+    let request = CloneRequest::new(cli.url, cli.target).with_pipeline(!cli.no_pipeline);
 
     match clone_repo_with_progress_ui(request, source_label, target_label) {
         Ok(report) => {
@@ -112,16 +116,37 @@ fn print_clone_stats(report: &CloneReport) {
     eprintln!("fcl: fetched {} refs", report.ref_count);
     eprintln!("fcl: wrote {} bytes of pack data", report.pack_bytes);
     eprintln!(
-        "fcl: discovery={}ms fetch={}ms ingest={}ms checkout={}ms",
-        report.discovery_ms, report.fetch_ms, report.ingest_ms, report.checkout_ms
+        "fcl: discovery={}ms fetch={}ms ingest={}ms checkout={}ms finalize={}ms hidden_before={}ms",
+        report.discovery_ms,
+        report.fetch_ms,
+        report.ingest_ms,
+        report.checkout_ms,
+        report.finalize_ms,
+        report.clone_unreported_ms
     );
     eprintln!(
-        "fcl: pack scan={}ms resolve={}ms idx_write={}ms object_state={}ms streaming_scan={}",
+        "fcl: fetch request={}ms first_byte={}ms sideband_read={}ms pack_write={}ms flush={}ms checksum={}ms throughput={}/s",
+        report.fetch_request_ms,
+        report.fetch_first_byte_ms,
+        report.fetch_sideband_read_ms,
+        report.fetch_pack_write_ms,
+        report.fetch_pack_flush_ms,
+        report.fetch_checksum_ms,
+        format_bytes(report.pack_receive_bytes_per_sec)
+    );
+    eprintln!(
+        "fcl: pack scan={}ms resolve={}ms idx_write={}ms object_state={}ms streaming_scan={} objects={} bases={} deltas={} ofs_deltas={} ref_deltas={} inflated_bytes={}",
         report.pack_scan_ms,
         report.pack_resolve_ms,
         report.pack_idx_write_ms,
         report.pack_object_state_ms,
-        report.streaming_pack_scan
+        report.streaming_pack_scan,
+        report.pack_object_count,
+        report.pack_base_object_count,
+        report.pack_delta_count,
+        report.pack_offset_delta_count,
+        report.pack_ref_delta_count,
+        report.pack_declared_inflated_bytes
     );
     eprintln!(
         "fcl: checkout manifest={}ms dirs={}ms files={}ms index={}ms files={} dirs={} blob_bytes={}",
@@ -152,14 +177,25 @@ fn print_clone_stats(report: &CloneReport) {
     );
     if report.pipeline_enabled {
         eprintln!(
-            "fcl: pipeline frames={} checkout_wait={}ms peak_pending_deltas={} arena_spill_bytes={}",
+            "fcl: pipeline frames={} checkout_wait={}ms wait_count={} wait_max={}ms peak_pending_deltas={} resolver={}ms resolver_wait={}ms queue_peak={} frame_send_wait={}ms arena_spill_bytes={}",
             report.pipeline_frame_count.unwrap_or_default(),
             report.pipeline_checkout_wait_ms.unwrap_or_default(),
+            report.pipeline_checkout_wait_count.unwrap_or_default(),
+            report.pipeline_checkout_wait_max_ms.unwrap_or_default(),
             report.pipeline_peak_pending_delta_count.unwrap_or_default(),
+            report.pipeline_resolver_wall_ms.unwrap_or_default(),
+            report
+                .pipeline_resolver_wait_for_frame_ms
+                .unwrap_or_default(),
+            report.pipeline_queue_peak_depth.unwrap_or_default(),
+            report.fetch_frame_send_wait_ms.unwrap_or_default(),
             report.pipeline_arena_spill_bytes.unwrap_or_default()
         );
     }
-    eprintln!("fcl: target uses {} bytes", report.target_bytes);
+    eprintln!(
+        "fcl: target uses {} bytes, target_size_scan={}ms",
+        report.target_bytes, report.target_size_scan_ms
+    );
     if let Some(rss_bytes) = report.rss_bytes {
         eprintln!("fcl: rss {rss_bytes} bytes");
     }

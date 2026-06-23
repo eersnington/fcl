@@ -140,6 +140,12 @@ pub struct PackIngestReport {
     pub resolve_ms: u128,
     pub idx_write_ms: u128,
     pub object_state_ms: u128,
+    pub object_count: usize,
+    pub base_object_count: usize,
+    pub delta_count: usize,
+    pub offset_delta_count: usize,
+    pub ref_delta_count: usize,
+    pub declared_inflated_bytes: u64,
     pub checkout_needed_blob_count: usize,
     pub checkout_ready_blob_count: usize,
     pub checkout_ready_blob_bytes: usize,
@@ -148,7 +154,12 @@ pub struct PackIngestReport {
     pub checkout_missing_blob_count: usize,
     pub pipeline_frame_count: Option<usize>,
     pub pipeline_checkout_wait_ms: Option<u128>,
+    pub pipeline_checkout_wait_count: Option<usize>,
+    pub pipeline_checkout_wait_max_ms: Option<u128>,
     pub pipeline_peak_pending_delta_count: Option<usize>,
+    pub pipeline_resolver_wall_ms: Option<u128>,
+    pub pipeline_resolver_wait_for_frame_ms: Option<u128>,
+    pub pipeline_queue_peak_depth: Option<usize>,
     pub pipeline_arena_spill_bytes: Option<u64>,
 }
 
@@ -164,7 +175,7 @@ pub struct CheckoutHint {
 
 #[derive(Debug)]
 pub enum PipelineEvent {
-    Frame(ObjectFrame),
+    Frames(Vec<ObjectFrame>),
     Finished {
         checksum: [u8; 20],
         pack_bytes: u64,
@@ -183,6 +194,8 @@ struct PipelineObjectStoreInner {
     state: Mutex<PipelineObjectStoreState>,
     ready: Condvar,
     wait_ms: AtomicU64,
+    wait_count: AtomicUsize,
+    wait_max_ms: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -260,12 +273,22 @@ impl PipelineObjectStore {
                 state: Mutex::new(PipelineObjectStoreState::default()),
                 ready: Condvar::new(),
                 wait_ms: AtomicU64::new(0),
+                wait_count: AtomicUsize::new(0),
+                wait_max_ms: AtomicU64::new(0),
             }),
         }
     }
 
     pub fn checkout_wait_ms(&self) -> u128 {
         u128::from(self.inner.wait_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn checkout_wait_count(&self) -> usize {
+        self.inner.wait_count.load(Ordering::Relaxed)
+    }
+
+    pub fn checkout_wait_max_ms(&self) -> u128 {
+        u128::from(self.inner.wait_max_ms.load(Ordering::Relaxed))
     }
 
     fn publish_object(
@@ -334,12 +357,15 @@ impl PipelineObjectStore {
     ) -> Result<T, CloneError> {
         let start = Instant::now();
         let mut state = self.lock_state("waiting for pipeline object")?;
+        let mut waited = false;
         loop {
             if let Some(value) = read(&state) {
-                self.inner.wait_ms.fetch_add(
-                    u64_saturating_from_u128(start.elapsed().as_millis()),
-                    Ordering::Relaxed,
-                );
+                let elapsed_ms = u64_saturating_from_u128(start.elapsed().as_millis());
+                self.inner.wait_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+                if waited {
+                    self.inner.wait_count.fetch_add(1, Ordering::Relaxed);
+                    update_atomic_max(&self.inner.wait_max_ms, elapsed_ms);
+                }
                 return Ok(value);
             }
             if let Some(failure) = &state.failure {
@@ -356,6 +382,7 @@ impl PipelineObjectStore {
                     detail: "pipeline completed before the object became available".to_owned(),
                 });
             }
+            waited = true;
             state = self
                 .inner
                 .ready
@@ -793,6 +820,16 @@ struct DeltaAdjacency {
     delta_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PackFrameMetrics {
+    object_count: usize,
+    base_object_count: usize,
+    delta_count: usize,
+    offset_delta_count: usize,
+    ref_delta_count: usize,
+    declared_inflated_bytes: u64,
+}
+
 #[cfg(test)]
 pub fn ingest_pack(pack_path: &Path, index_path: &Path) -> Result<PackIngestReport, CloneError> {
     let pack = read_pack_arc(pack_path)?;
@@ -854,6 +891,7 @@ pub fn ingest_scanned_pack(
     options: PackIngestOptions,
 ) -> Result<PackIngestReport, CloneError> {
     let resolve_start = Instant::now();
+    let frame_metrics = pack_frame_metrics(&scan.frames);
     let resolved = resolve_inflated_frames(
         pack_path,
         &pack,
@@ -928,6 +966,12 @@ pub fn ingest_scanned_pack(
         resolve_ms,
         idx_write_ms,
         object_state_ms,
+        object_count: frame_metrics.object_count,
+        base_object_count: frame_metrics.base_object_count,
+        delta_count: frame_metrics.delta_count,
+        offset_delta_count: frame_metrics.offset_delta_count,
+        ref_delta_count: frame_metrics.ref_delta_count,
+        declared_inflated_bytes: frame_metrics.declared_inflated_bytes,
         checkout_needed_blob_count: cache.checkout_needed_blob_count,
         checkout_ready_blob_count: cache.checkout_ready_blob_count,
         checkout_ready_blob_bytes: cache.checkout_ready_blob_bytes,
@@ -936,7 +980,12 @@ pub fn ingest_scanned_pack(
         checkout_missing_blob_count: cache.checkout_missing_blob_count,
         pipeline_frame_count: None,
         pipeline_checkout_wait_ms: None,
+        pipeline_checkout_wait_count: None,
+        pipeline_checkout_wait_max_ms: None,
         pipeline_peak_pending_delta_count: None,
+        pipeline_resolver_wall_ms: None,
+        pipeline_resolver_wait_for_frame_ms: None,
+        pipeline_queue_peak_depth: None,
         pipeline_arena_spill_bytes: None,
     })
 }
@@ -944,7 +993,7 @@ pub fn ingest_scanned_pack(
 pub fn ingest_pack_pipeline(
     pack_path: &Path,
     index_path: &Path,
-    receiver: Receiver<PipelineEvent>,
+    receiver: &Receiver<PipelineEvent>,
     store: PipelineObjectStore,
 ) -> Result<PackIngestReport, CloneError> {
     let start = Instant::now();
@@ -953,31 +1002,40 @@ pub fn ingest_pack_pipeline(
         .unwrap_or_else(|| Path::new("."))
         .join("fcl-spill");
     let mut resolver = PipelineResolver::new(pack_path, index_path, &spill_dir, store)?;
-    let mut checksum = None;
-    let mut scan_ms = 0u128;
-    for event in receiver {
+    let mut wait_for_frame_ms = 0u128;
+    let (checksum, scan_ms) = loop {
+        let wait_start = Instant::now();
+        let event = receiver
+            .recv()
+            .map_err(|error| CloneError::PackIndexFailed {
+                path: pack_path.to_owned(),
+                operation: "receiving pipeline object frame",
+                detail: error.to_string(),
+            })?;
+        wait_for_frame_ms += wait_start.elapsed().as_millis();
         match event {
-            PipelineEvent::Frame(frame) => resolver.accept_frame(frame)?,
+            PipelineEvent::Frames(frames) => {
+                resolver.update_queue_peak_depth(frames.len());
+                for frame in frames {
+                    resolver.accept_frame(frame)?;
+                }
+            }
             PipelineEvent::Finished {
                 checksum: received_checksum,
                 pack_bytes,
                 scan_ms: received_scan_ms,
             } => {
                 let _ = pack_bytes;
-                checksum = Some(received_checksum);
-                scan_ms = received_scan_ms;
-                break;
+                break (received_checksum, received_scan_ms);
             }
         }
-    }
-    let Some(checksum) = checksum else {
-        return Err(CloneError::PackIndexFailed {
-            path: pack_path.to_owned(),
-            operation: "resolving pipeline pack",
-            detail: "fetch completed without sending a pack checksum".to_owned(),
-        });
     };
-    resolver.finish(checksum, scan_ms, start.elapsed().as_millis())
+    resolver.finish(
+        checksum,
+        scan_ms,
+        start.elapsed().as_millis(),
+        wait_for_frame_ms,
+    )
 }
 
 struct PipelineResolver {
@@ -994,7 +1052,11 @@ struct PipelineResolver {
     pending_by_oid: HashMap<[u8; 20], Vec<PendingDelta>>,
     frame_count: usize,
     peak_pending_delta_count: usize,
+    queue_peak_depth: usize,
     arena_spill_bytes: u64,
+    resident_blob_bytes: u64,
+    resident_blob_limit: u64,
+    spill_blobs_over_budget: bool,
 }
 
 #[derive(Debug)]
@@ -1015,6 +1077,8 @@ impl PipelineResolver {
             operation: "creating pipeline spill directory",
             detail: error.to_string(),
         })?;
+        let resident_blob_limit =
+            optional_usize_env("FCL_CHECKOUT_BLOB_CACHE_BYTES")?.unwrap_or(256 * 1024 * 1024);
         Ok(Self {
             pack_path: pack_path.to_owned(),
             index_path: index_path.to_owned(),
@@ -1029,7 +1093,12 @@ impl PipelineResolver {
             pending_by_oid: HashMap::new(),
             frame_count: 0,
             peak_pending_delta_count: 0,
+            queue_peak_depth: 0,
             arena_spill_bytes: 0,
+            resident_blob_bytes: 0,
+            resident_blob_limit: u64::try_from(resident_blob_limit).unwrap_or(u64::MAX),
+            spill_blobs_over_budget: env_bool("FCL_PIPELINE_SPILL_BLOBS")
+                || env_bool("FCL_SPILL_BLOBS"),
         })
     }
 
@@ -1157,12 +1226,14 @@ impl PipelineResolver {
         if object_type != ObjectType::Blob {
             return Ok(ObjectDataState::Resident(Arc::clone(data)));
         }
-        let resident_limit =
-            optional_usize_env("FCL_CHECKOUT_BLOB_CACHE_BYTES")?.unwrap_or(256 * 1024 * 1024);
         let data_len = data.len();
-        let resident_limit = u64::try_from(resident_limit).unwrap_or(u64::MAX);
         let data_len_u64 = u64::try_from(data_len).unwrap_or(u64::MAX);
-        if self.arena_spill_bytes.saturating_add(data_len_u64) <= resident_limit {
+        if self.resident_blob_bytes.saturating_add(data_len_u64) <= self.resident_blob_limit {
+            self.resident_blob_bytes = self.resident_blob_bytes.saturating_add(data_len_u64);
+            return Ok(ObjectDataState::Resident(Arc::clone(data)));
+        }
+        if !self.spill_blobs_over_budget {
+            self.resident_blob_bytes = self.resident_blob_bytes.saturating_add(data_len_u64);
             return Ok(ObjectDataState::Resident(Arc::clone(data)));
         }
         let spilled = spill_object(&self.pack_path, &self.spill_dir, data)?;
@@ -1179,6 +1250,7 @@ impl PipelineResolver {
         checksum: [u8; 20],
         scan_ms: u128,
         resolve_ms: u128,
+        wait_for_frame_ms: u128,
     ) -> Result<PackIngestReport, CloneError> {
         let pending = self.pending_by_offset.values().map(Vec::len).sum::<usize>()
             + self.pending_by_oid.values().map(Vec::len).sum::<usize>();
@@ -1198,6 +1270,7 @@ impl PipelineResolver {
         let store_state = self.store.finish()?;
         let object_state_ms = object_state_start.elapsed().as_millis();
         let pack = PackStorage::open_file_backed(&self.pack_path)?;
+        let frame_metrics = pack_frame_metrics(&self.frames);
         Ok(PackIngestReport {
             index: PackIndex {
                 pack_path: self.pack_path,
@@ -1215,6 +1288,12 @@ impl PipelineResolver {
             resolve_ms,
             idx_write_ms,
             object_state_ms,
+            object_count: frame_metrics.object_count,
+            base_object_count: frame_metrics.base_object_count,
+            delta_count: frame_metrics.delta_count,
+            offset_delta_count: frame_metrics.offset_delta_count,
+            ref_delta_count: frame_metrics.ref_delta_count,
+            declared_inflated_bytes: frame_metrics.declared_inflated_bytes,
             checkout_needed_blob_count: 0,
             checkout_ready_blob_count: 0,
             checkout_ready_blob_bytes: 0,
@@ -1223,9 +1302,18 @@ impl PipelineResolver {
             checkout_missing_blob_count: 0,
             pipeline_frame_count: Some(self.frame_count),
             pipeline_checkout_wait_ms: Some(self.store.checkout_wait_ms()),
+            pipeline_checkout_wait_count: Some(self.store.checkout_wait_count()),
+            pipeline_checkout_wait_max_ms: Some(self.store.checkout_wait_max_ms()),
             pipeline_peak_pending_delta_count: Some(self.peak_pending_delta_count),
+            pipeline_resolver_wall_ms: Some(resolve_ms),
+            pipeline_resolver_wait_for_frame_ms: Some(wait_for_frame_ms),
+            pipeline_queue_peak_depth: Some(self.queue_peak_depth),
             pipeline_arena_spill_bytes: Some(self.arena_spill_bytes),
         })
+    }
+
+    fn update_queue_peak_depth(&mut self, depth: usize) {
+        self.queue_peak_depth = self.queue_peak_depth.max(depth);
     }
 
     fn update_peak_pending(&mut self) {
@@ -1344,6 +1432,40 @@ fn build_object_states(
         checkout_spilled_blob_bytes,
         checkout_missing_blob_count,
     })
+}
+
+fn pack_frame_metrics(frames: &[ObjectFrame]) -> PackFrameMetrics {
+    let mut metrics = PackFrameMetrics {
+        object_count: frames.len(),
+        ..PackFrameMetrics::default()
+    };
+    for frame in frames {
+        metrics.declared_inflated_bytes = metrics
+            .declared_inflated_bytes
+            .saturating_add(frame.declared_size);
+        match frame.encoded {
+            EncodedObjectKind::Base(_) => metrics.base_object_count += 1,
+            EncodedObjectKind::OffsetDelta { .. } => {
+                metrics.delta_count += 1;
+                metrics.offset_delta_count += 1;
+            }
+            EncodedObjectKind::RefDelta { .. } => {
+                metrics.delta_count += 1;
+                metrics.ref_delta_count += 1;
+            }
+        }
+    }
+    metrics
+}
+
+fn update_atomic_max(value: &AtomicU64, candidate: u64) {
+    let mut current = value.load(Ordering::Relaxed);
+    while candidate > current {
+        match value.compare_exchange(current, candidate, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(previous) => current = previous,
+        }
+    }
 }
 
 fn enforce_max_spill_bytes(
@@ -3002,7 +3124,7 @@ fn validate_unique_objects(index_path: &Path, entries: &[IndexEntry]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckoutHint, EncodedObjectKind, ObjectDataState, PackIndex, PackIngestOptions,
+        CheckoutHint, EncodedObjectKind, ObjectDataState, ObjectType, PackIndex, PackIngestOptions,
         PackStorage, ScanPayload, ingest_pack, ingest_scanned_pack, scan_pack, validate_pack,
     };
     use crate::checkout::materialize_default_branch;
@@ -3325,11 +3447,9 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(scan.frames.len() + 1);
         let store = super::PipelineObjectStore::new(&pack_path);
 
-        for frame in scan.frames.clone() {
-            sender
-                .send(super::PipelineEvent::Frame(frame))
-                .expect("frame should send");
-        }
+        sender
+            .send(super::PipelineEvent::Frames(scan.frames.clone()))
+            .expect("frames should send");
         sender
             .send(super::PipelineEvent::Finished {
                 checksum: scan.checksum,
@@ -3340,10 +3460,65 @@ mod tests {
         drop(sender);
 
         let pipeline =
-            super::ingest_pack_pipeline(&pack_path, &temp.join("pipeline.idx"), receiver, store)
+            super::ingest_pack_pipeline(&pack_path, &temp.join("pipeline.idx"), &receiver, store)
                 .expect("pipeline ingest should work");
 
         assert_same_pack_metadata(&pipeline.index, &sequential.index);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn pipeline_resolver_should_spill_after_cumulative_resident_blob_limit() {
+        let temp = test_temp_dir("pipeline-resident-budget");
+        let pack_path = temp.join("pack.pack");
+        let index_path = temp.join("pack.idx");
+        let spill_dir = temp.join("spill");
+        let store = super::PipelineObjectStore::new(&pack_path);
+        let mut resolver = super::PipelineResolver::new(&pack_path, &index_path, &spill_dir, store)
+            .expect("resolver should be created");
+        resolver.resident_blob_limit = 3;
+        resolver.spill_blobs_over_budget = true;
+        let first = Arc::<[u8]>::from([1u8, 2]);
+        let second = Arc::<[u8]>::from([3u8, 4]);
+
+        let first_state = resolver
+            .pipeline_object_state(&first, ObjectType::Blob)
+            .expect("first blob state should build");
+        let second_state = resolver
+            .pipeline_object_state(&second, ObjectType::Blob)
+            .expect("second blob state should build");
+
+        assert!(matches!(first_state, ObjectDataState::Resident(_)));
+        assert!(matches!(second_state, ObjectDataState::Spilled { .. }));
+        assert_eq!(resolver.resident_blob_bytes, 2);
+        assert_eq!(resolver.arena_spill_bytes, 2);
+        fs::remove_dir_all(temp).expect("test temp directory should be removed");
+    }
+
+    #[test]
+    fn pipeline_resolver_should_keep_over_budget_blobs_resident_by_default() {
+        let temp = test_temp_dir("pipeline-resident-over-budget");
+        let pack_path = temp.join("pack.pack");
+        let index_path = temp.join("pack.idx");
+        let spill_dir = temp.join("spill");
+        let store = super::PipelineObjectStore::new(&pack_path);
+        let mut resolver = super::PipelineResolver::new(&pack_path, &index_path, &spill_dir, store)
+            .expect("resolver should be created");
+        resolver.resident_blob_limit = 3;
+        let first = Arc::<[u8]>::from([1u8, 2]);
+        let second = Arc::<[u8]>::from([3u8, 4]);
+
+        let first_state = resolver
+            .pipeline_object_state(&first, ObjectType::Blob)
+            .expect("first blob state should build");
+        let second_state = resolver
+            .pipeline_object_state(&second, ObjectType::Blob)
+            .expect("second blob state should build");
+
+        assert!(matches!(first_state, ObjectDataState::Resident(_)));
+        assert!(matches!(second_state, ObjectDataState::Resident(_)));
+        assert_eq!(resolver.resident_blob_bytes, 4);
+        assert_eq!(resolver.arena_spill_bytes, 0);
         fs::remove_dir_all(temp).expect("test temp directory should be removed");
     }
 
