@@ -22,18 +22,22 @@ use fcl_core::{
     about = "Fast full Git clone from first principles"
 )]
 struct CloneCli {
-    /// Print detailed clone timings and cache metrics after completion.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Print detailed clone timings and cache metrics after completion."
+    )]
     stats: bool,
 
-    /// Disable the default streaming pipeline and use the sequential clone path.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Disable the default streaming pipeline and use the sequential clone path."
+    )]
     no_pipeline: bool,
 
-    /// Repository URL to clone.
+    #[arg(help = "Repository URL to clone.")]
     url: String,
 
-    /// Target directory. Defaults to the repository name.
+    #[arg(help = "Target directory. Defaults to the repository name.")]
     target: Option<PathBuf>,
 }
 
@@ -872,14 +876,13 @@ fn format_clock(elapsed: Duration) -> String {
     about = "Fast local clone using filesystem copy-on-write"
 )]
 struct LocalCli {
-    /// Print detailed local clone metrics after completion.
-    #[arg(long)]
+    #[arg(long, help = "Print detailed local clone metrics after completion.")]
     stats: bool,
 
-    /// Local source repository path.
+    #[arg(help = "Local source repository path.")]
     source: PathBuf,
 
-    /// Target directory. Defaults to '<source>-fcl'.
+    #[arg(help = "Target directory. Defaults to '<source>-fcl'.")]
     target: Option<PathBuf>,
 }
 
