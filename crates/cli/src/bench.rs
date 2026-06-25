@@ -1,36 +1,79 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use fcl_core::{CloneError, CloneReport, CloneRequest, clone_repo};
+use fcl_core::{
+    CloneError, CloneReport, CloneRequest, PackReplayInflatePolicy, PackReplayReport,
+    PackReplayRequest, clone_repo, replay_pack,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "fcl bench", about = "Benchmark fcl against git clone")]
 pub struct BenchCli {
-    /// Repository URL to benchmark.
-    pub url: String,
+    #[arg(help = "Repository URL to benchmark.")]
+    pub url: Option<String>,
 
-    /// Number of runs per tool.
-    #[arg(long, default_value_t = 1)]
+    #[arg(
+        long,
+        help = "Replay a saved pack file locally instead of cloning a URL."
+    )]
+    pub pack: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 1, help = "Number of runs per tool.")]
     pub runs: usize,
 
-    /// Also run stock git clone.
-    #[arg(long)]
+    #[arg(long, help = "Also run stock git clone.")]
     pub compare_git: bool,
 
-    /// Order to run tools when comparing fcl with git.
-    #[arg(long, value_enum, default_value_t = BenchOrder::Alternate)]
+    #[arg(
+        long,
+        help = "In --pack mode, also run git index-pack as an explicit control."
+    )]
+    pub compare_index_pack: bool,
+
+    #[arg(
+        long,
+        default_value = "1",
+        help = "Comma-separated resolver worker counts for --pack mode."
+    )]
+    pub resolver_workers: String,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = BenchInflatePolicy::Current,
+        help = "Inflate policy for --pack mode."
+    )]
+    pub inflate_policy: BenchInflatePolicy,
+
+    #[arg(
+        long,
+        default_value = "1",
+        help = "Comma-separated git pack.threads values for --compare-index-pack."
+    )]
+    pub git_pack_threads: String,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = BenchOrder::Alternate,
+        help = "Order to run tools when comparing fcl with git."
+    )]
     pub order: BenchOrder,
 
-    /// Capture Git Trace2 perf output during timed git clone runs.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Capture Git Trace2 perf output during timed git clone runs."
+    )]
     pub git_trace2: bool,
 
-    /// Validate each cloned repository with git fsck/status/diff.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Validate each cloned repository with git fsck/status/diff."
+    )]
     pub validate: bool,
 
     #[command(flatten)]
@@ -40,10 +83,29 @@ pub struct BenchCli {
     pub output: BenchOutput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BenchInflatePolicy {
+    Current,
+    MetadataOnly,
+    Inflate,
+}
+
+impl BenchInflatePolicy {
+    const fn as_core(self) -> PackReplayInflatePolicy {
+        match self {
+            Self::Current => PackReplayInflatePolicy::Current,
+            Self::MetadataOnly => PackReplayInflatePolicy::MetadataOnly,
+            Self::Inflate => PackReplayInflatePolicy::Inflate,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 pub struct BenchPipeline {
-    /// Disable the default streaming pipeline for fcl benchmark runs.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Disable the default streaming pipeline for fcl benchmark runs."
+    )]
     pub no_pipeline: bool,
 }
 
@@ -56,12 +118,10 @@ pub enum BenchOrder {
 
 #[derive(Debug, Parser)]
 pub struct BenchOutput {
-    /// Emit CSV rows.
-    #[arg(long)]
+    #[arg(long, help = "Emit CSV rows.")]
     pub csv: bool,
 
-    /// Emit JSON lines.
-    #[arg(long)]
+    #[arg(long, help = "Emit JSON lines.")]
     pub json: bool,
 }
 
@@ -146,6 +206,19 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
         });
     }
 
+    if cli.pack.is_some() {
+        return run_pack_bench(cli);
+    }
+
+    let url = clone_bench_url(cli)?;
+
+    if cli.compare_index_pack {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "--compare-index-pack is only valid with --pack".to_owned(),
+        });
+    }
+
     if cli.output.csv {
         println!(
             "url,tool,compression_backend,run,total_ms,discovery_ms,fetch_ms,ingest_ms,pack_scan_ms,pack_resolve_ms,pack_idx_write_ms,pack_object_state_ms,streaming_pack_scan,checkout_ms,checkout_manifest_ms,checkout_dir_create_ms,checkout_file_materialize_ms,checkout_index_write_ms,checkout_file_count,checkout_dir_count,checkout_blob_bytes,pack_bytes,ref_count,retained_object_count,retained_object_bytes,spilled_object_count,spilled_object_bytes,checkout_needed_blob_count,checkout_ready_blob_count,checkout_ready_blob_bytes,checkout_spilled_blob_count,checkout_spilled_blob_bytes,checkout_missing_blob_count,reconstructed_object_count,pipeline_enabled,pipeline_frame_count,pipeline_checkout_wait_ms,pipeline_peak_pending_delta_count,pipeline_arena_spill_bytes,target_bytes,rss_bytes,git_trace_path,git_remote_ms,git_index_pack_ms,git_checkout_ms,git_trace_parse_error,clone_wall_ms,clone_unreported_ms,fetch_request_ms,fetch_first_byte_ms,fetch_sideband_read_ms,fetch_pack_write_ms,fetch_pack_flush_ms,fetch_checksum_ms,fetch_frame_send_wait_ms,pack_receive_bytes_per_sec,pack_object_count,pack_base_object_count,pack_delta_count,pack_offset_delta_count,pack_ref_delta_count,pack_declared_inflated_bytes,pipeline_checkout_wait_count,pipeline_checkout_wait_max_ms,pipeline_resolver_wall_ms,pipeline_resolver_wait_for_frame_ms,pipeline_queue_peak_depth,finalize_ms,target_size_scan_ms,validated"
@@ -155,19 +228,335 @@ pub fn run_bench(cli: &BenchCli) -> Result<(), CloneError> {
     let mut results = Vec::new();
     for run in 1..=cli.runs {
         if cli.compare_git && run_git_first(cli.order, run) {
-            run_git_bench(cli, run, &mut results)?;
+            run_git_bench(cli, url, run, &mut results)?;
         }
 
-        run_fcl_bench(cli, run, &mut results)?;
+        run_fcl_bench(cli, url, run, &mut results)?;
 
         if cli.compare_git && !run_git_first(cli.order, run) {
-            run_git_bench(cli, run, &mut results)?;
+            run_git_bench(cli, url, run, &mut results)?;
         }
     }
 
     print_summaries(cli, &results);
 
     Ok(())
+}
+
+fn clone_bench_url(cli: &BenchCli) -> Result<&str, CloneError> {
+    cli.url
+        .as_deref()
+        .ok_or_else(|| CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "fcl bench requires a repository URL unless --pack is provided".to_owned(),
+        })
+}
+
+#[derive(Debug)]
+struct PackBenchResult {
+    tool: &'static str,
+    run: usize,
+    pack_path: PathBuf,
+    compression_backend: &'static str,
+    resolver_workers: Option<usize>,
+    inflate_policy: Option<&'static str>,
+    git_pack_threads: Option<usize>,
+    total_ms: u128,
+    scan_ms: Option<u128>,
+    resolve_ms: Option<u128>,
+    idx_write_ms: Option<u128>,
+    eof_to_complete_ms: Option<u128>,
+    object_count: Option<usize>,
+    base_object_count: Option<usize>,
+    delta_count: Option<usize>,
+    offset_delta_count: Option<usize>,
+    ref_delta_count: Option<usize>,
+    declared_inflated_bytes: Option<u64>,
+    reconstructed_object_count: Option<usize>,
+}
+
+impl PackBenchResult {
+    fn from_fcl(run: usize, pack_path: &Path, report: &PackReplayReport) -> Self {
+        Self {
+            tool: "fcl-pack",
+            run,
+            pack_path: pack_path.to_owned(),
+            compression_backend: report.compression_backend,
+            resolver_workers: Some(report.resolver_workers),
+            inflate_policy: Some(replay_policy_label(report.inflate_policy)),
+            git_pack_threads: None,
+            total_ms: report.scan_ms.saturating_add(report.eof_to_complete_ms),
+            scan_ms: Some(report.scan_ms),
+            resolve_ms: Some(report.resolve_ms),
+            idx_write_ms: Some(report.idx_write_ms),
+            eof_to_complete_ms: Some(report.eof_to_complete_ms),
+            object_count: Some(report.object_count),
+            base_object_count: Some(report.base_object_count),
+            delta_count: Some(report.delta_count),
+            offset_delta_count: Some(report.offset_delta_count),
+            ref_delta_count: Some(report.ref_delta_count),
+            declared_inflated_bytes: Some(report.declared_inflated_bytes),
+            reconstructed_object_count: Some(report.reconstructed_object_count),
+        }
+    }
+
+    fn from_git(run: usize, pack_path: &Path, git_pack_threads: usize, total_ms: u128) -> Self {
+        Self {
+            tool: "git-index-pack",
+            run,
+            pack_path: pack_path.to_owned(),
+            compression_backend: "git",
+            resolver_workers: None,
+            inflate_policy: None,
+            git_pack_threads: Some(git_pack_threads),
+            total_ms,
+            scan_ms: None,
+            resolve_ms: None,
+            idx_write_ms: None,
+            eof_to_complete_ms: None,
+            object_count: None,
+            base_object_count: None,
+            delta_count: None,
+            offset_delta_count: None,
+            ref_delta_count: None,
+            declared_inflated_bytes: None,
+            reconstructed_object_count: None,
+        }
+    }
+}
+
+fn run_pack_bench(cli: &BenchCli) -> Result<(), CloneError> {
+    let pack_path = cli
+        .pack
+        .as_deref()
+        .ok_or_else(|| CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "--pack mode requires a pack path".to_owned(),
+        })?;
+    if cli.url.is_some() {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "--pack mode does not accept a repository URL".to_owned(),
+        });
+    }
+    if cli.compare_git {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "--compare-git compares clone commands; use --compare-index-pack with --pack"
+                .to_owned(),
+        });
+    }
+    if cli.git_trace2 {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "--git-trace2 is only valid for URL clone benchmarks".to_owned(),
+        });
+    }
+    if cli.pipeline.no_pipeline {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "parsing benchmark arguments",
+            detail: "--no-pipeline is only valid for URL clone benchmarks".to_owned(),
+        });
+    }
+    if !pack_path.exists() {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "opening pack benchmark input",
+            detail: format!("pack file `{}` does not exist", pack_path.display()),
+        });
+    }
+    let resolver_workers = parse_usize_list(&cli.resolver_workers, "--resolver-workers")?;
+    let git_pack_threads = parse_usize_list(&cli.git_pack_threads, "--git-pack-threads")?;
+
+    if cli.output.csv {
+        print_pack_csv_header();
+    }
+
+    for run in 1..=cli.runs {
+        let reports = replay_pack(&PackReplayRequest {
+            pack_path: pack_path.to_owned(),
+            resolver_workers: resolver_workers.clone(),
+            inflate_policy: cli.inflate_policy.as_core(),
+        })?;
+        for report in &reports {
+            print_pack_result(cli, &PackBenchResult::from_fcl(run, pack_path, report));
+        }
+        if cli.compare_index_pack {
+            for &threads in &git_pack_threads {
+                let total_ms = run_git_index_pack(pack_path, run, threads)?;
+                print_pack_result(
+                    cli,
+                    &PackBenchResult::from_git(run, pack_path, threads, total_ms),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_usize_list(raw: &str, flag: &'static str) -> Result<Vec<usize>, CloneError> {
+    let mut values = Vec::new();
+    for value in raw.split(',') {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(CloneError::BenchmarkFailed {
+                operation: "parsing benchmark arguments",
+                detail: format!("{flag} contains an empty value"),
+            });
+        }
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|error| CloneError::BenchmarkFailed {
+                operation: "parsing benchmark arguments",
+                detail: format!("{flag} value `{value}` is not an unsigned integer: {error}"),
+            })?;
+        if parsed == 0 {
+            return Err(CloneError::BenchmarkFailed {
+                operation: "parsing benchmark arguments",
+                detail: format!("{flag} values must be greater than 0"),
+            });
+        }
+        values.push(parsed);
+    }
+    Ok(values)
+}
+
+fn run_git_index_pack(pack_path: &Path, run: usize, threads: usize) -> Result<u128, CloneError> {
+    let input = fs::File::open(pack_path).map_err(|error| CloneError::BenchmarkFailed {
+        operation: "opening pack for git index-pack",
+        detail: format!("{}: {error}", pack_path.display()),
+    })?;
+    let idx_path = bench_target("git-index-pack", run).with_extension(format!("{threads}.idx"));
+    if let Some(parent) = idx_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| CloneError::BenchmarkFailed {
+            operation: "creating git index-pack output directory",
+            detail: format!("{}: {error}", parent.display()),
+        })?;
+    }
+    let _ = fs::remove_file(&idx_path);
+    let start = Instant::now();
+    let output = Command::new("git")
+        .arg("-c")
+        .arg(format!("pack.threads={threads}"))
+        .arg("index-pack")
+        .arg("--stdin")
+        .arg("-o")
+        .arg(&idx_path)
+        .stdin(Stdio::from(input))
+        .output()
+        .map_err(|error| CloneError::BenchmarkFailed {
+            operation: "running git index-pack",
+            detail: error.to_string(),
+        })?;
+    let total_ms = start.elapsed().as_millis();
+    let _ = fs::remove_file(&idx_path);
+    if !output.status.success() {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "running git index-pack",
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(total_ms)
+}
+
+fn replay_policy_label(policy: PackReplayInflatePolicy) -> &'static str {
+    match policy {
+        PackReplayInflatePolicy::Current => "current",
+        PackReplayInflatePolicy::MetadataOnly => "metadata-only",
+        PackReplayInflatePolicy::Inflate => "inflate",
+    }
+}
+
+fn print_pack_csv_header() {
+    println!(
+        "mode,pack_path,tool,compression_backend,run,total_ms,resolver_workers,inflate_policy,git_pack_threads,scan_ms,resolve_ms,idx_write_ms,eof_to_complete_ms,object_count,base_object_count,delta_count,offset_delta_count,ref_delta_count,declared_inflated_bytes,reconstructed_object_count"
+    );
+}
+
+fn print_pack_result(cli: &BenchCli, result: &PackBenchResult) {
+    if cli.output.json {
+        print_pack_json_result(result);
+    } else if cli.output.csv {
+        print_pack_csv_result(result);
+    } else {
+        print_pack_plain_result(result);
+    }
+}
+
+fn print_pack_json_result(result: &PackBenchResult) {
+    println!(
+        "{{\"mode\":\"pack\",\"pack_path\":\"{}\",\"tool\":\"{}\",\"compression_backend\":\"{}\",\"run\":{},\"total_ms\":{},\"resolver_workers\":{},\"inflate_policy\":{},\"git_pack_threads\":{},\"scan_ms\":{},\"resolve_ms\":{},\"idx_write_ms\":{},\"eof_to_complete_ms\":{},\"object_count\":{},\"base_object_count\":{},\"delta_count\":{},\"offset_delta_count\":{},\"ref_delta_count\":{},\"declared_inflated_bytes\":{},\"reconstructed_object_count\":{}}}",
+        escape_json(&result.pack_path.display().to_string()),
+        result.tool,
+        escape_json(result.compression_backend),
+        result.run,
+        result.total_ms,
+        option_usize(result.resolver_workers),
+        option_string(result.inflate_policy),
+        option_usize(result.git_pack_threads),
+        option_u128(result.scan_ms),
+        option_u128(result.resolve_ms),
+        option_u128(result.idx_write_ms),
+        option_u128(result.eof_to_complete_ms),
+        option_usize(result.object_count),
+        option_usize(result.base_object_count),
+        option_usize(result.delta_count),
+        option_usize(result.offset_delta_count),
+        option_usize(result.ref_delta_count),
+        option_u64(result.declared_inflated_bytes),
+        option_usize(result.reconstructed_object_count)
+    );
+}
+
+fn print_pack_csv_result(result: &PackBenchResult) {
+    let fields = vec![
+        "pack".to_owned(),
+        csv_string(Some(&result.pack_path.display().to_string())),
+        result.tool.to_owned(),
+        result.compression_backend.to_owned(),
+        result.run.to_string(),
+        result.total_ms.to_string(),
+        csv_usize(result.resolver_workers),
+        csv_string(result.inflate_policy),
+        csv_usize(result.git_pack_threads),
+        csv_u128(result.scan_ms),
+        csv_u128(result.resolve_ms),
+        csv_u128(result.idx_write_ms),
+        csv_u128(result.eof_to_complete_ms),
+        csv_usize(result.object_count),
+        csv_usize(result.base_object_count),
+        csv_usize(result.delta_count),
+        csv_usize(result.offset_delta_count),
+        csv_usize(result.ref_delta_count),
+        csv_u64(result.declared_inflated_bytes),
+        csv_usize(result.reconstructed_object_count),
+    ];
+    println!("{}", fields.join(","));
+}
+
+fn print_pack_plain_result(result: &PackBenchResult) {
+    println!(
+        "{} run {} backend={}: pack={} total={}ms resolver_workers={} inflate_policy={} git_pack_threads={} scan={} resolve={} idx_write={} eof_to_complete={} objects={} bases={} deltas={} ofs_deltas={} ref_deltas={} inflated_bytes={} reconstructed_objects={}",
+        result.tool,
+        result.run,
+        result.compression_backend,
+        result.pack_path.display(),
+        result.total_ms,
+        usize_or_dash(result.resolver_workers),
+        string_or_dash(result.inflate_policy),
+        usize_or_dash(result.git_pack_threads),
+        ms_or_dash(result.scan_ms),
+        ms_or_dash(result.resolve_ms),
+        ms_or_dash(result.idx_write_ms),
+        ms_or_dash(result.eof_to_complete_ms),
+        usize_or_dash(result.object_count),
+        usize_or_dash(result.base_object_count),
+        usize_or_dash(result.delta_count),
+        usize_or_dash(result.offset_delta_count),
+        usize_or_dash(result.ref_delta_count),
+        u64_or_dash(result.declared_inflated_bytes),
+        usize_or_dash(result.reconstructed_object_count)
+    );
 }
 
 const fn run_git_first(order: BenchOrder, run: usize) -> bool {
@@ -180,26 +569,28 @@ const fn run_git_first(order: BenchOrder, run: usize) -> bool {
 
 fn run_fcl_bench(
     cli: &BenchCli,
+    url: &str,
     run: usize,
     results: &mut Vec<BenchResult>,
 ) -> Result<(), CloneError> {
     let target = bench_target("fcl", run);
     remove_target(&target)?;
     let report = clone_repo(
-        CloneRequest::new(cli.url.clone(), Some(target.clone()))
+        CloneRequest::new(url.to_owned(), Some(target.clone()))
             .with_pipeline(!cli.pipeline.no_pipeline),
     )?;
     if cli.validate {
         validate_repo(&target)?;
     }
     let result = BenchResult::from_fcl(run, &report, cli.validate);
-    print_result(cli, &result);
+    print_result(cli, url, &result);
     results.push(result);
     Ok(())
 }
 
 fn run_git_bench(
     cli: &BenchCli,
+    url: &str,
     run: usize,
     results: &mut Vec<BenchResult>,
 ) -> Result<(), CloneError> {
@@ -215,7 +606,7 @@ fn run_git_bench(
         })?;
     }
     let start = Instant::now();
-    run_git_clone(&cli.url, &target, trace_path.as_deref())?;
+    run_git_clone(url, &target, trace_path.as_deref())?;
     let total_ms = start.elapsed().as_millis();
     if cli.validate {
         validate_repo(&target)?;
@@ -296,7 +687,7 @@ fn run_git_bench(
         git_trace_parse_error: git_trace.parse_error,
         validated: cli.validate,
     };
-    print_result(cli, &result);
+    print_result(cli, url, &result);
     results.push(result);
     Ok(())
 }
@@ -658,11 +1049,11 @@ fn run_git_validation(target: &Path, args: &[&str]) -> Result<(), CloneError> {
     Ok(())
 }
 
-fn print_result(cli: &BenchCli, result: &BenchResult) {
+fn print_result(cli: &BenchCli, url: &str, result: &BenchResult) {
     if cli.output.json {
-        print_json_result(&cli.url, result);
+        print_json_result(url, result);
     } else if cli.output.csv {
-        print_csv_result(&cli.url, result);
+        print_csv_result(url, result);
     } else {
         print_plain_result(result);
     }

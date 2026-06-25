@@ -21,3 +21,4 @@ pub use local::{
     local_clone, local_clone_with_progress,
 };
 pub use metrics::CloneReport;
+pub use pack::{PackReplayInflatePolicy, PackReplayReport, PackReplayRequest, replay_pack};

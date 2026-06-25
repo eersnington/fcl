@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
 use crc32fast::Hasher as Crc32;
 use flate2::{Decompress, FlushDecompress, Status};
-use rayon::prelude::*;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use sha1::{Digest, Sha1};
 
 use crate::error::CloneError;
@@ -159,6 +159,38 @@ pub struct PackIngestReport {
     pub pipeline_resolver_wait_for_frame_ms: Option<u128>,
     pub pipeline_queue_peak_depth: Option<usize>,
     pub pipeline_arena_spill_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackReplayRequest {
+    pub pack_path: PathBuf,
+    pub resolver_workers: Vec<usize>,
+    pub inflate_policy: PackReplayInflatePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackReplayInflatePolicy {
+    Current,
+    MetadataOnly,
+    Inflate,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackReplayReport {
+    pub compression_backend: &'static str,
+    pub resolver_workers: usize,
+    pub inflate_policy: PackReplayInflatePolicy,
+    pub scan_ms: u128,
+    pub resolve_ms: u128,
+    pub idx_write_ms: u128,
+    pub eof_to_complete_ms: u128,
+    pub object_count: usize,
+    pub base_object_count: usize,
+    pub delta_count: usize,
+    pub offset_delta_count: usize,
+    pub ref_delta_count: usize,
+    pub declared_inflated_bytes: u64,
+    pub reconstructed_object_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -853,6 +885,125 @@ pub fn ingest_fetched_pack(
 
     let pack = PackStorage::open_file_backed(pack_path)?;
     ingest_scanned_pack(pack_path, index_path, pack, &scan, scan_ms, options)
+}
+
+pub fn replay_pack(request: &PackReplayRequest) -> Result<Vec<PackReplayReport>, CloneError> {
+    if request.resolver_workers.is_empty() {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "parsing pack replay arguments",
+            detail: "--resolver-workers must include at least one worker count".to_owned(),
+        });
+    }
+    for workers in &request.resolver_workers {
+        if *workers == 0 {
+            return Err(CloneError::BenchmarkFailed {
+                operation: "parsing pack replay arguments",
+                detail: "--resolver-workers values must be greater than 0".to_owned(),
+            });
+        }
+    }
+
+    let mut reports = Vec::with_capacity(request.resolver_workers.len());
+    for &resolver_workers in &request.resolver_workers {
+        reports.push(replay_pack_once(
+            &request.pack_path,
+            resolver_workers,
+            request.inflate_policy,
+        )?);
+    }
+    Ok(reports)
+}
+
+fn replay_pack_once(
+    pack_path: &Path,
+    resolver_workers: usize,
+    inflate_policy: PackReplayInflatePolicy,
+) -> Result<PackReplayReport, CloneError> {
+    if !pack_path.exists() {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "opening pack replay input",
+            detail: format!("pack file `{}` does not exist", pack_path.display()),
+        });
+    }
+    if !pack_path.is_file() {
+        return Err(CloneError::BenchmarkFailed {
+            operation: "opening pack replay input",
+            detail: format!("pack path `{}` is not a file", pack_path.display()),
+        });
+    }
+
+    let checksum = validate_pack_file_checksum(pack_path)?;
+    let scan_payload = replay_scan_payload(inflate_policy);
+    let scan_start = Instant::now();
+    let scan = scan_pack_file_windowed(pack_path, scan_payload, checksum)?;
+    let scan_ms = scan_start.elapsed().as_millis();
+    let idx_path = replay_idx_path(pack_path, resolver_workers);
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(resolver_workers)
+        .build()
+        .map_err(|error| CloneError::BenchmarkFailed {
+            operation: "creating pack replay worker pool",
+            detail: error.to_string(),
+        })?;
+    let replay_start = Instant::now();
+    let ingest = pool.install(|| {
+        ingest_scanned_pack(
+            pack_path,
+            &idx_path,
+            PackStorage::open_file_backed(pack_path)?,
+            &scan,
+            scan_ms,
+            PackIngestOptions::default(),
+        )
+    });
+    let report = ingest?;
+    let eof_to_complete_ms = replay_start.elapsed().as_millis();
+    let _ = fs::remove_file(&idx_path);
+
+    Ok(PackReplayReport {
+        compression_backend: crate::compression::compression_backend(),
+        resolver_workers,
+        inflate_policy,
+        scan_ms: report.scan_ms,
+        resolve_ms: report.resolve_ms,
+        idx_write_ms: report.idx_write_ms,
+        eof_to_complete_ms,
+        object_count: report.object_count,
+        base_object_count: report.base_object_count,
+        delta_count: report.delta_count,
+        offset_delta_count: report.offset_delta_count,
+        ref_delta_count: report.ref_delta_count,
+        declared_inflated_bytes: report.declared_inflated_bytes,
+        reconstructed_object_count: report.index.reconstructed_object_count(),
+    })
+}
+
+fn replay_scan_payload(policy: PackReplayInflatePolicy) -> ScanPayload {
+    match policy {
+        PackReplayInflatePolicy::Current => {
+            if env_bool("FCL_LOW_MEMORY") {
+                ScanPayload::MetadataOnly
+            } else {
+                ScanPayload::Inflate
+            }
+        }
+        PackReplayInflatePolicy::MetadataOnly => ScanPayload::MetadataOnly,
+        PackReplayInflatePolicy::Inflate => ScanPayload::Inflate,
+    }
+}
+
+fn replay_idx_path(pack_path: &Path, resolver_workers: usize) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let file_name = pack_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pack");
+    std::env::temp_dir().join(format!(
+        "fcl-replay-{file_name}-{resolver_workers}-{}-{stamp}.idx",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -2192,6 +2343,56 @@ fn scan_pack_file_windowed(
         scanner.feed(&buffer[..read])?;
     }
     scanner.finish(checksum)
+}
+
+fn validate_pack_file_checksum(pack_path: &Path) -> Result<[u8; 20], CloneError> {
+    let mut file = File::open(pack_path).map_err(|error| CloneError::PackIndexFailed {
+        path: pack_path.to_owned(),
+        operation: "opening pack file for checksum validation",
+        detail: error.to_string(),
+    })?;
+    let mut hasher = Sha1::new();
+    let mut trailer = Vec::new();
+    let mut buffer = vec![0u8; env_usize("FCL_PACK_CHECKSUM_BUFFER", 1024 * 1024)];
+    let mut total = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| CloneError::PackIndexFailed {
+                path: pack_path.to_owned(),
+                operation: "reading pack file for checksum validation",
+                detail: error.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        trailer.extend_from_slice(&buffer[..read]);
+        if trailer.len() > 20 {
+            let hash_len = trailer.len() - 20;
+            hasher.update(&trailer[..hash_len]);
+            trailer.drain(..hash_len);
+        }
+    }
+    if total < 32 || trailer.len() != 20 {
+        return Err(CloneError::PackIndexFailed {
+            path: pack_path.to_owned(),
+            operation: "validating pack checksum",
+            detail: "pack file is too small to contain a complete PACK header and trailer"
+                .to_owned(),
+        });
+    }
+    let actual = hasher.finalize();
+    if trailer.as_slice() != actual.as_slice() {
+        return Err(CloneError::PackChecksumMismatch {
+            path: pack_path.to_owned(),
+            expected: hex::encode(&trailer),
+            actual: hex::encode(actual),
+        });
+    }
+    let mut checksum = [0u8; 20];
+    checksum.copy_from_slice(&trailer);
+    Ok(checksum)
 }
 
 #[cfg(test)]
